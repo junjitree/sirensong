@@ -49,7 +49,6 @@ if connect_to_wifi(ssid_name):
 
     except Exception as e:
         print(f"An error occurred: {e}")
-        driver.save_screenshot("error_debug.png")
     finally:
         driver.quit()
 else:
