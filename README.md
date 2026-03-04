@@ -1,44 +1,86 @@
 # StarBypass
 
-StarBypass is a Python script that automates the process of connecting to
-Starbucks Wi-Fi captive portals. It uses Selenium to simulate a user clicking
-"Accept" on the terms and conditions page.
+StarBypass automates the process of connecting to Starbucks Wi-Fi captive
+portals. It uses Selenium to simulate a user clicking "Accept" on the terms and
+conditions page.
+
+Two versions are available: a Python script and a Rust application.
 
 ## Prerequisites
 
-- Python 3
+Both versions require:
+
 - `nmcli` (NetworkManager command-line tool)
 - Google Chrome
-- ChromeDriver
+- ChromeDriver (installed and in your `PATH`)
+
+### Python Version
+
+- Python 3
+- `selenium` library
+
+### Rust Version
+
+- Rust and Cargo
 
 ## Installation
 
 1. Clone this repository:
 
-    ```bash
-    git clone https://github.com/junjitree/starbypass.git
-    cd starbypass
-    ```
+   ```bash
+   git clone https://github.com/junjitree/starbypass.git
+   cd starbypass
+   ```
 
-2. Install the required Python libraries:
+### Python Setup
 
-    ```bash
-    pip install selenium
-    ```
+Install the required Python libraries:
 
-3. Make sure you have Google Chrome and the corresponding ChromeDriver
-    installed and in your PATH.
+```bash
+pip install selenium
+```
+
+### Rust Setup
+
+The Rust version is built using Cargo:
+
+```bash
+cargo build --release
+```
 
 ## Usage
+
+### Python
 
 Run the script:
 
 ```bash
-python bypass.py
+python bypass.py [SSID]
 ```
 
-The script will attempt to connect to the "Starbucks Customer" Wi-Fi network and
-then automate the captive portal login.
+By default, the script will attempt to connect to the "Starbucks Customer" Wi-Fi
+network. You can specify a different SSID as an argument:
+
+```bash
+python bypass.py "My Custom SSID"
+```
+
+### Rust
+
+Run the application using Cargo:
+
+```bash
+cargo run -- [SSID]
+```
+
+Or run the compiled binary:
+
+```bash
+./target/release/starbypass [SSID]
+```
+
+Like the Python version, it defaults to "Starbucks Customer" if no SSID is
+provided.
 
 ## License
 
