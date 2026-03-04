@@ -9,15 +9,11 @@ const GREEN_END: &str = "\x1b[0m";
 const RED_START: &str = "\x1b[31m";
 const RED_END: &str = "\x1b[0m";
 
-fn error(msg: &str) {
-    eprintln!("{}", msg);
-}
-
 fn connect_to_wifi(ssid: &str) -> bool {
     let right = format!("{}✅{}", GREEN_START, GREEN_END);
     let left = format!("{}🚫{}", RED_START, RED_END);
 
-    println!("{}Connecting to {}...", right, ssid);
+    println!("{right}Connecting to {ssid}...");
 
     let nmcli_up = Command::new("nmcli")
         .args(["connection", "up", ssid])
@@ -25,10 +21,10 @@ fn connect_to_wifi(ssid: &str) -> bool {
 
     match nmcli_up {
         Ok(output) if output.status.success() => {
-            println!("{}Network command sent successfully...", right);
+            println!("{right}Network command sent successfully...");
         }
         Ok(_) | Err(_) => {
-            error(&format!("{}Failed to connect to WiFi: {}!!!", left, ssid));
+            eprintln!("{left}Failed to connect to WiFi: {ssid}!!!");
             return false;
         }
     }
@@ -55,7 +51,7 @@ fn connect_to_wifi(ssid: &str) -> bool {
             }
 
             if current_ssid == ssid {
-                println!("{}Connected after {} tries...", right, tries);
+                println!("{right}Connected after {tries} tries...");
                 return true;
             }
         }
@@ -64,7 +60,7 @@ fn connect_to_wifi(ssid: &str) -> bool {
         std::thread::sleep(Duration::from_millis(500));
     }
 
-    error(&format!("{}Failed to connect to WiFi: {}!!!", left, ssid));
+    eprintln!("{left}Failed to connect to WiFi: {ssid}!!!");
     false
 }
 
@@ -81,10 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let left = format!("{}🚫{}", RED_START, RED_END);
 
     if !connect_to_wifi(&ssid) {
-        error(&format!(
-            "{}Aborting: Could not establish network connection!!!",
-            left
-        ));
+        eprintln!("{left}Aborting: Could not establish network connection!!!",);
         std::process::exit(1);
     }
 
@@ -108,20 +101,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(driver) => driver,
         Err(e) => {
             let _ = chromedriver.kill();
-            error(&format!("{}Failed to connect to webdriver: {}!!!", left, e));
+            eprintln!("{left}Failed to connect to webdriver: {e}!!!");
             std::process::exit(1);
         }
     };
 
-    println!("{}Navigating to trigger portal...", right);
+    println!("{right}Navigating to trigger portal...");
     if let Err(e) = driver.goto("http://google.com").await {
-        error(&format!("{}Failed to navigate: {}!!!", left, e));
+        eprintln!("{left}Failed to navigate: {e}!!!");
         let _ = driver.quit().await;
         let _ = chromedriver.kill();
         std::process::exit(1);
     }
 
-    println!("{}Checking if we are already authenticated...", right);
+    println!("{right}Checking if we are already authenticated...");
 
     let mut authenticated = false;
     for _ in 0..15 {
@@ -136,9 +129,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if authenticated {
-        println!("{}We're already authenticated...", right);
+        println!("{right}We're already authenticated...");
     } else {
-        println!("{}Looking for radio button...", right);
+        println!("{right}Looking for radio button...");
 
         let mut clicked_radio = false;
         for _ in 0..15 {
@@ -155,7 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if clicked_radio {
             sleep(Duration::from_secs(1)).await;
 
-            println!("{}Looking for submit button...", right);
+            println!("{right}Looking for submit button...");
             let mut submitted = false;
             for _ in 0..15 {
                 if let Ok(submit) = driver.find(By::Name("commit")).await
@@ -169,12 +162,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if submitted {
-                println!("{}Success! Portal submitted...", right);
+                println!("{right}Success! Portal submitted...");
             } else {
-                error(&format!("{}Could not find or click submit button!!!", left));
+                eprintln!("{left}Could not find or click submit button!!!");
             }
         } else {
-            error(&format!("{}Could not find or click radio button!!!", left));
+            eprintln!("{left}Could not find or click radio button!!!");
         }
     }
 

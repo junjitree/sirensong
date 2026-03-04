@@ -42,10 +42,16 @@ pip install selenium
 
 ### Rust Setup
 
-The Rust version is built using Cargo:
+The Rust version can be built using Cargo:
 
 ```bash
 cargo build --release
+```
+
+Alternatively, you can install it directly to your system's Cargo bin directory:
+
+```bash
+cargo install --path .
 ```
 
 ## Usage
@@ -67,7 +73,13 @@ python bypass.py "My Custom SSID"
 
 ### Rust
 
-Run the application using Cargo:
+If you installed the binary using `cargo install`, you can run it directly:
+
+```bash
+starbypass [SSID]
+```
+
+Otherwise, run the application using Cargo:
 
 ```bash
 cargo run -- [SSID]
