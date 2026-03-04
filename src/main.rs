@@ -9,61 +9,6 @@ const GREEN_END: &str = "\x1b[0m";
 const RED_START: &str = "\x1b[31m";
 const RED_END: &str = "\x1b[0m";
 
-fn connect_to_wifi(ssid: &str) -> bool {
-    let right = format!("{}✅{}", GREEN_START, GREEN_END);
-    let left = format!("{}🚫{}", RED_START, RED_END);
-
-    println!("{right}Connecting to {ssid}...");
-
-    let nmcli_up = Command::new("nmcli")
-        .args(["connection", "up", ssid])
-        .output();
-
-    match nmcli_up {
-        Ok(output) if output.status.success() => {
-            println!("{right}Network command sent successfully...");
-        }
-        Ok(_) | Err(_) => {
-            eprintln!("{left}Failed to connect to WiFi: {ssid}!!!");
-            return false;
-        }
-    }
-
-    let mut tries = 1;
-    while tries < 20 {
-        let result = Command::new("nmcli")
-            .args(["-t", "-f", "active,ssid", "dev", "wifi"])
-            .output();
-
-        if let Ok(output) = result
-            && output.status.success()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let mut current_ssid = String::new();
-            for line in stdout.lines() {
-                if line.starts_with("yes:") {
-                    let parts: Vec<&str> = line.split(':').collect();
-                    if parts.len() > 1 {
-                        current_ssid = parts[1].to_string();
-                    }
-                    break;
-                }
-            }
-
-            if current_ssid == ssid {
-                println!("{right}Connected after {tries} tries...");
-                return true;
-            }
-        }
-
-        tries += 1;
-        std::thread::sleep(Duration::from_millis(500));
-    }
-
-    eprintln!("{left}Failed to connect to WiFi: {ssid}!!!");
-    false
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
@@ -73,11 +18,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Starbucks Customer".to_string()
     };
 
-    let right = format!("{}✅{}", GREEN_START, GREEN_END);
-    let left = format!("{}🚫{}", RED_START, RED_END);
+    let right = format!("{GREEN_START}✅{GREEN_END}");
+    let left = format!("{RED_START}🚫{RED_END}");
 
     if !connect_to_wifi(&ssid) {
-        eprintln!("{left}Aborting: Could not establish network connection!!!",);
+        eprintln!("{left}Aborting: Could not establish network connection!!!");
         std::process::exit(1);
     }
 
@@ -175,4 +120,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = chromedriver.kill();
 
     Ok(())
+}
+
+fn connect_to_wifi(ssid: &str) -> bool {
+    let right = format!("{}✅{}", GREEN_START, GREEN_END);
+    let left = format!("{}🚫{}", RED_START, RED_END);
+
+    println!("{right}Connecting to {ssid}...");
+
+    let nmcli_up = Command::new("nmcli")
+        .args(["connection", "up", ssid])
+        .output();
+
+    match nmcli_up {
+        Ok(output) if output.status.success() => {
+            println!("{right}Network command sent successfully...");
+        }
+        Ok(_) | Err(_) => {
+            eprintln!("{left}Failed to connect to WiFi: {ssid}!!!");
+            return false;
+        }
+    }
+
+    let mut tries = 1;
+    while tries < 20 {
+        let result = Command::new("nmcli")
+            .args(["-t", "-f", "active,ssid", "dev", "wifi"])
+            .output();
+
+        if let Ok(output) = result
+            && output.status.success()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut current_ssid = String::new();
+            for line in stdout.lines() {
+                if line.starts_with("yes:") {
+                    let parts: Vec<&str> = line.split(':').collect();
+                    if parts.len() > 1 {
+                        current_ssid = parts[1].to_string();
+                    }
+                    break;
+                }
+            }
+
+            if current_ssid == ssid {
+                println!("{right}Connected after {tries} tries...");
+                return true;
+            }
+        }
+
+        tries += 1;
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    eprintln!("{left}Failed to connect to WiFi: {ssid}!!!");
+    false
 }
