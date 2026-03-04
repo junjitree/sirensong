@@ -128,51 +128,102 @@ fn connect_to_wifi(ssid: &str) -> bool {
 
     println!("{right}Connecting to {ssid}...");
 
-    let nmcli_up = Command::new("nmcli")
-        .args(["connection", "up", ssid])
-        .output();
-
-    match nmcli_up {
-        Ok(output) if output.status.success() => {
-            println!("{right}Network command sent successfully...");
-        }
-        Ok(_) | Err(_) => {
-            eprintln!("{left}Failed to connect to WiFi: {ssid}!!!");
-            return false;
-        }
-    }
-
-    let mut tries = 1;
-    while tries < 20 {
-        let result = Command::new("nmcli")
-            .args(["-t", "-f", "active,ssid", "dev", "wifi"])
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("networksetup")
+            .args(["-listallhardwareports"])
             .output();
 
-        if let Ok(output) = result
-            && output.status.success()
-        {
+        let mut wifi_interface = "en0".to_string();
+        if let Ok(output) = output {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            let mut current_ssid = String::new();
-            for line in stdout.lines() {
-                if line.starts_with("yes:") {
-                    let parts: Vec<&str> = line.split(':').collect();
-                    if parts.len() > 1 {
-                        current_ssid = parts[1].to_string();
+            let lines: Vec<&str> = stdout.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if line.contains("Wi-Fi") {
+                    if i + 1 < lines.len() {
+                        wifi_interface = lines[i + 1].replace("Device:", "").trim().to_string();
                     }
                     break;
                 }
             }
+        }
 
-            if current_ssid == ssid {
-                println!("{right}Connected after {tries} tries...");
-                return true;
+        let _ = Command::new("networksetup")
+            .args(["-setairportnetwork", &wifi_interface, ssid])
+            .output();
+
+        println!("{right}Network command sent successfully...");
+
+        let mut tries = 1;
+        while tries < 20 {
+            let result = Command::new("networksetup")
+                .args(["-getairportnetwork", &wifi_interface])
+                .output();
+
+            if let Ok(output) = result {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if stdout.contains(ssid) {
+                    println!("{right}Connected after {tries} tries...");
+                    return true;
+                }
+            }
+
+            tries += 1;
+            std::thread::sleep(Duration::from_millis(500));
+        }
+
+        eprintln!("{left}Failed to connect to WiFi: {ssid}!!!");
+        return false;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let nmcli_up = Command::new("nmcli")
+            .args(["connection", "up", ssid])
+            .output();
+
+        match nmcli_up {
+            Ok(output) if output.status.success() => {
+                println!("{right}Network command sent successfully...");
+            }
+            Ok(_) | Err(_) => {
+                eprintln!("{left}Failed to connect to WiFi: {ssid}!!!");
+                return false;
             }
         }
 
-        tries += 1;
-        std::thread::sleep(Duration::from_millis(500));
-    }
+        let mut tries = 1;
+        while tries < 20 {
+            let result = Command::new("nmcli")
+                .args(["-t", "-f", "active,ssid", "dev", "wifi"])
+                .output();
 
-    eprintln!("{left}Failed to connect to WiFi: {ssid}!!!");
-    false
+            if let Ok(output) = result
+                && output.status.success()
+            {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let mut current_ssid = String::new();
+                for line in stdout.lines() {
+                    if line.starts_with("yes:") {
+                        let parts: Vec<&str> = line.split(':').collect();
+                        if parts.len() > 1 {
+                            current_ssid = parts[1].to_string();
+                        }
+                        break;
+                    }
+                }
+
+                if current_ssid == ssid {
+                    println!("{right}Connected after {tries} tries...");
+                    return true;
+                }
+            }
+
+            tries += 1;
+            std::thread::sleep(Duration::from_millis(500));
+        }
+
+        eprintln!("{left}Failed to connect to WiFi: {ssid}!!!");
+        false
+    }
 }
