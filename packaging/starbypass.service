@@ -1,0 +1,28 @@
+# StarBypass watch-mode user service.
+#
+# Install (per-user, recommended):
+#   mkdir -p ~/.config/systemd/user
+#   cp packaging/starbypass.service ~/.config/systemd/user/
+#   # edit ExecStart below if your binary path or SSID differ
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now starbypass.service
+#   systemctl --user status starbypass.service
+#   journalctl --user -u starbypass -f      # follow logs
+#
+# Requires the user session to linger so it runs without an active login:
+#   sudo loginctl enable-linger "$USER"
+
+[Unit]
+Description=StarBypass - keep Starbucks Wi-Fi captive portal authenticated
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust the binary path (cargo install puts it in ~/.cargo/bin) and SSID.
+ExecStart=%h/.cargo/bin/starbypass --watch --interval 60 "Starbucks Customer"
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
