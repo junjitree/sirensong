@@ -30,8 +30,8 @@ struct Config {
 
 fn print_help() {
     println!(
-        "starbypass - automate Starbucks Wi-Fi captive portal login\n\n\
-         USAGE:\n    starbypass [OPTIONS] [SSID]\n\n\
+        "sirensong - automate Starbucks Wi-Fi captive portal login\n\n\
+         USAGE:\n    sirensong [OPTIONS] [SSID]\n\n\
          ARGS:\n    <SSID>    Wi-Fi network name (default: \"{DEFAULT_SSID}\")\n\n\
          OPTIONS:\n\
          \x20   -o, --once             Authenticate once and exit (default: watch and re-auth on drop)\n\
@@ -59,7 +59,7 @@ fn parse_args_from<I: Iterator<Item = String>>(args: I) -> Result<Config, String
                 std::process::exit(0);
             }
             "-V" | "--version" => {
-                println!("starbypass {}", env!("CARGO_PKG_VERSION"));
+                println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             "-i" | "--interval" => {

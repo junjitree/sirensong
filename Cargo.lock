@@ -1597,6 +1597,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
+name = "sirensong"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "reqwest 0.12.28",
+ "thirtyfour",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "wiremock",
+]
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1623,19 +1636,6 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
-
-[[package]]
-name = "starbypass"
-version = "0.1.0"
-dependencies = [
- "regex",
- "reqwest 0.12.28",
- "thirtyfour",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "wiremock",
-]
 
 [[package]]
 name = "stringmatch"

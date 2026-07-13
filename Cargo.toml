@@ -1,10 +1,10 @@
 [package]
-name = "starbypass"
+name = "sirensong"
 version = "0.1.0"
 edition = "2024"
-description = "Automates connecting to Starbucks Wi-Fi captive portals"
+description = "Automates Starbucks Wi-Fi captive-portal login with MAC rotation"
 license = "MIT"
-repository = "https://github.com/junjitree/starbypass"
+repository = "https://github.com/junjitree/sirensong"
 readme = "README.md"
 keywords = ["starbucks", "wifi", "captive-portal", "automation"]
 categories = ["command-line-utilities"]

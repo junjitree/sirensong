@@ -1,8 +1,9 @@
-# StarBypass
+# SirenSong
 
-StarBypass automates the process of connecting to Starbucks Wi-Fi captive
-portals. It drives a headless browser to click "Accept" on the terms and
-conditions page.
+SirenSong answers the Starbucks siren's call for you — it automates login to
+Starbucks Wi-Fi captive portals. It authenticates over plain HTTP (falling back
+to a headless browser) and rolls a fresh MAC address on each reconnect, so the
+portal's per-device time limit never runs out.
 
 ## Prerequisites
 
@@ -16,8 +17,8 @@ conditions page.
 1. Clone this repository:
 
    ```bash
-   git clone https://github.com/junjitree/starbypass.git
-   cd starbypass
+   git clone https://github.com/junjitree/sirensong.git
+   cd sirensong
    ```
 
 2. Build with Cargo:
@@ -37,7 +38,7 @@ cargo install --path .
 If you installed the binary using `cargo install`, you can run it directly:
 
 ```bash
-starbypass [SSID]
+sirensong [SSID]
 ```
 
 Otherwise, run the application using Cargo:
@@ -49,18 +50,18 @@ cargo run -- [SSID]
 Or run the compiled binary:
 
 ```bash
-./target/release/starbypass [SSID]
+./target/release/sirensong [SSID]
 ```
 
 It defaults to "Starbucks Customer" if no SSID is provided.
 
-By default starbypass runs in **watch mode** — it stays up and re-authenticates
+By default sirensong runs in **watch mode** — it stays up and re-authenticates
 whenever the portal drops. Pass `--once` to authenticate a single time and exit.
 
 ### Options
 
 ```
-starbypass [OPTIONS] [SSID]
+sirensong [OPTIONS] [SSID]
 
   -o, --once             Authenticate once and exit (default: watch and re-auth on drop)
   -i, --interval <SECS>  Watch poll interval in seconds (default: 60)
@@ -68,7 +69,7 @@ starbypass [OPTIONS] [SSID]
   -h, --help             Print help
 ```
 
-Before launching a browser, starbypass does a lightweight `generate_204`
+Before launching a browser, sirensong does a lightweight `generate_204`
 connectivity check and exits early if you are already online, so repeated runs
 are cheap.
 
@@ -80,9 +81,9 @@ it drops. Just run it in a terminal while you are at the café and stop it
 (Ctrl-C) when you leave:
 
 ```bash
-starbypass                       # watch "Starbucks Customer"
-starbypass "Some Other Cafe"     # watch a different SSID
-starbypass -i 30                 # poll every 30s
+sirensong                       # watch "Starbucks Customer"
+sirensong "Some Other Cafe"     # watch a different SSID
+sirensong -i 30                 # poll every 30s
 ```
 
 It only reconnects when it confirms it is offline (several failed probes, so a
@@ -92,7 +93,7 @@ join next alone instead of hunting for the Starbucks AP.
 
 ### How re-auth works (MAC rotation)
 
-Captive portals cap usage **per device (MAC address)**. StarBypass relies on
+Captive portals cap usage **per device (MAC address)**. SirenSong relies on
 NetworkManager being configured to randomize the MAC on each connection —
 
 ```ini
@@ -101,7 +102,7 @@ NetworkManager being configured to randomize the MAC on each connection —
 wifi.cloned-mac-address=random
 ```
 
-When connectivity drops, StarBypass **cycles the connection down and back up**,
+When connectivity drops, SirenSong **cycles the connection down and back up**,
 which makes NetworkManager roll a fresh random MAC. The portal then sees a
 brand-new device and grants a new session, which the browser flow accepts. This
 is why it can re-authenticate indefinitely — each pass looks like a different
