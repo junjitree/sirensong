@@ -209,14 +209,14 @@ fn ssid_in_range(ssid: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Declare offline only after several consecutive failed probes, so a single
+/// Declare offline only after two consecutive failed probes, so a single
 /// transient blip does not trigger a needless (and disruptive) reconnect.
 async fn confirmed_offline() -> bool {
-    for i in 0..3 {
+    for i in 0..2 {
         if is_online().await {
             return false;
         }
-        if i < 2 {
+        if i < 1 {
             sleep(Duration::from_secs(2)).await;
         }
     }
