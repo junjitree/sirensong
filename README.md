@@ -54,12 +54,15 @@ Or run the compiled binary:
 
 It defaults to "Starbucks Customer" if no SSID is provided.
 
+By default starbypass runs in **watch mode** — it stays up and re-authenticates
+whenever the portal drops. Pass `--once` to authenticate a single time and exit.
+
 ### Options
 
 ```
 starbypass [OPTIONS] [SSID]
 
-  -w, --watch            Stay running; re-auth whenever connectivity drops
+  -o, --once             Authenticate once and exit (default: watch and re-auth on drop)
   -i, --interval <SECS>  Watch poll interval in seconds (default: 60)
   -q, --quiet            Suppress status output (errors still print)
   -h, --help             Print help
@@ -69,15 +72,17 @@ Before launching a browser, starbypass does a lightweight `generate_204`
 connectivity check and exits early if you are already online, so repeated runs
 are cheap.
 
-### Watch mode
+### Watch mode (default)
 
 Captive-portal sessions expire on the venue's clock. Watch mode keeps you
 authenticated by polling connectivity and re-running the portal login only when
-it drops. Run it in a terminal while you are at the café and stop it (Ctrl-C)
-when you leave:
+it drops. Just run it in a terminal while you are at the café and stop it
+(Ctrl-C) when you leave:
 
 ```bash
-starbypass --watch --interval 60 "Starbucks Customer"
+starbypass                       # watch "Starbucks Customer"
+starbypass "Some Other Cafe"     # watch a different SSID
+starbypass -i 30                 # poll every 30s
 ```
 
 It only reconnects when it confirms it is offline (several failed probes, so a

@@ -23,7 +23,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(900);
 
 struct Config {
     ssid: String,
-    watch: bool,
+    once: bool,
     interval: Duration,
     quiet: bool,
 }
@@ -34,7 +34,7 @@ fn print_help() {
          USAGE:\n    starbypass [OPTIONS] [SSID]\n\n\
          ARGS:\n    <SSID>    Wi-Fi network name (default: \"{DEFAULT_SSID}\")\n\n\
          OPTIONS:\n\
-         \x20   -w, --watch            Stay running; re-auth whenever connectivity drops\n\
+         \x20   -o, --once             Authenticate once and exit (default: watch and re-auth on drop)\n\
          \x20   -i, --interval <SECS>  Watch poll interval in seconds (default: 60)\n\
          \x20   -q, --quiet            Only log errors (overrides RUST_LOG)\n\
          \x20   -h, --help             Print this help\n\n\
@@ -44,14 +44,14 @@ fn print_help() {
 
 fn parse_args_from<I: Iterator<Item = String>>(args: I) -> Result<Config, String> {
     let mut ssid = None;
-    let mut watch = false;
+    let mut once = false;
     let mut interval = Duration::from_secs(60);
     let mut quiet = false;
     let mut args = args.peekable();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "-w" | "--watch" => watch = true,
+            "-o" | "--once" => once = true,
             "-q" | "--quiet" => quiet = true,
             "-h" | "--help" => {
                 print_help();
@@ -78,7 +78,7 @@ fn parse_args_from<I: Iterator<Item = String>>(args: I) -> Result<Config, String
 
     Ok(Config {
         ssid: ssid.unwrap_or_else(|| DEFAULT_SSID.to_string()),
-        watch,
+        once,
         interval,
         quiet,
     })
@@ -616,10 +616,10 @@ async fn main() {
 
     init_logging(cfg.quiet);
 
-    if cfg.watch {
-        run_watch(&cfg).await;
-    } else {
+    if cfg.once {
         std::process::exit(if reconcile(&cfg).await { 0 } else { 1 });
+    } else {
+        run_watch(&cfg).await;
     }
 }
 
@@ -635,16 +635,16 @@ mod tests {
     fn defaults_when_no_args() {
         let cfg = cfg_from(&[]).unwrap();
         assert_eq!(cfg.ssid, DEFAULT_SSID);
-        assert!(!cfg.watch);
+        assert!(!cfg.once);
         assert!(!cfg.quiet);
         assert_eq!(cfg.interval, Duration::from_secs(60));
     }
 
     #[test]
     fn parses_ssid_and_flags() {
-        let cfg = cfg_from(&["--watch", "-q", "-i", "30", "My Cafe"]).unwrap();
+        let cfg = cfg_from(&["--once", "-q", "-i", "30", "My Cafe"]).unwrap();
         assert_eq!(cfg.ssid, "My Cafe");
-        assert!(cfg.watch);
+        assert!(cfg.once);
         assert!(cfg.quiet);
         assert_eq!(cfg.interval, Duration::from_secs(30));
     }
