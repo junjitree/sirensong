@@ -1,178 +1,733 @@
 use std::env;
-use std::process::{Command, Stdio};
+use std::net::TcpListener;
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
+
+use log::{error, info, warn};
 use thirtyfour::prelude::*;
+use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::time::sleep;
 
-const GREEN_START: &str = "\x1b[32m";
-const GREEN_END: &str = "\x1b[0m";
-const RED_START: &str = "\x1b[31m";
-const RED_END: &str = "\x1b[0m";
+const DEFAULT_SSID: &str = "Starbucks Customer";
+const CONNECTIVITY_HOST: &str = "connectivitycheck.gstatic.com";
+/// Captive-detect URL the HTTP login hits first; a portal intercepts it and
+/// redirects to the splash page. Parameterized into `http_login` so tests can
+/// point it at a mock server.
+const CAPTIVE_DETECT_URL: &str = "http://connectivitycheck.gstatic.com/generate_204";
+/// Present as a real browser so portals that gate on User-Agent (rejecting or
+/// serving stripped pages to non-browser clients) treat the HTTP fast path the
+/// same as the Selenium flow.
+const BROWSER_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+/// Upper bound on watch-mode backoff between failed reconcile attempts.
+const MAX_BACKOFF: Duration = Duration::from_secs(900);
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().collect();
-    let ssid = if args.len() > 1 {
-        args[1].clone()
-    } else {
-        "Starbucks Customer".to_string()
-    };
-
-    let right = format!("{GREEN_START}✅{GREEN_END}");
-    let left = format!("{RED_START}🚫{RED_END}");
-
-    if !connect_to_wifi(&ssid) {
-        eprintln!("{left}Aborting: Could not establish network connection!!!");
-        std::process::exit(1);
-    }
-
-    #[allow(clippy::zombie_processes)]
-    let mut chromedriver = Command::new("chromedriver")
-        .arg("--port=9515")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("Failed to start chromedriver. Make sure it's installed and in your PATH.");
-
-    sleep(Duration::from_secs(1)).await;
-
-    let mut caps = DesiredCapabilities::chrome();
-    caps.add_arg("--headless=new")?;
-    caps.add_arg("--no-sandbox")?;
-    caps.add_arg("--disable-dev-shm-usage")?;
-
-    let driver_result = WebDriver::new("http://localhost:9515", caps).await;
-    let driver = match driver_result {
-        Ok(driver) => driver,
-        Err(e) => {
-            let _ = chromedriver.kill();
-            eprintln!("{left}Failed to connect to webdriver: {e}!!!");
-            std::process::exit(1);
-        }
-    };
-
-    println!("{right}Navigating to trigger portal...");
-    if let Err(e) = driver.goto("http://google.com").await {
-        eprintln!("{left}Failed to navigate: {e}!!!");
-        let _ = driver.quit().await;
-        let _ = chromedriver.kill();
-        std::process::exit(1);
-    }
-
-    println!("{right}Checking if we are already authenticated...");
-
-    let mut authenticated = false;
-    for _ in 0..15 {
-        if let Ok(url) = driver.current_url().await
-            && (url.as_str().starts_with("https://google.com")
-                || url.as_str().starts_with("https://www.google.com"))
-        {
-            authenticated = true;
-            break;
-        }
-        sleep(Duration::from_secs(1)).await;
-    }
-
-    if authenticated {
-        println!("{right}We're already authenticated...");
-    } else {
-        println!("{right}Looking for radio button...");
-
-        let mut clicked_radio = false;
-        for _ in 0..15 {
-            if let Ok(radio) = driver.find(By::Id("option_free")).await
-                && radio.is_displayed().await.unwrap_or(false)
-                && radio.click().await.is_ok()
-            {
-                clicked_radio = true;
-                break;
-            }
-            sleep(Duration::from_secs(1)).await;
-        }
-
-        if clicked_radio {
-            sleep(Duration::from_secs(1)).await;
-
-            println!("{right}Looking for submit button...");
-            let mut submitted = false;
-            for _ in 0..15 {
-                if let Ok(submit) = driver.find(By::Name("commit")).await
-                    && submit.is_displayed().await.unwrap_or(false)
-                    && let Ok(_) = submit.click().await
-                {
-                    submitted = true;
-                    break;
-                }
-                sleep(Duration::from_secs(1)).await;
-            }
-
-            if submitted {
-                println!("{right}Success! Portal submitted...");
-            } else {
-                eprintln!("{left}Could not find or click submit button!!!");
-            }
-        } else {
-            eprintln!("{left}Could not find or click radio button!!!");
-        }
-    }
-
-    let _ = driver.quit().await;
-    let _ = chromedriver.kill();
-
-    Ok(())
+struct Config {
+    ssid: String,
+    watch: bool,
+    interval: Duration,
+    quiet: bool,
 }
 
-fn connect_to_wifi(ssid: &str) -> bool {
-    let right = format!("{}✅{}", GREEN_START, GREEN_END);
-    let left = format!("{}🚫{}", RED_START, RED_END);
+fn print_help() {
+    println!(
+        "starbypass - automate Starbucks Wi-Fi captive portal login\n\n\
+         USAGE:\n    starbypass [OPTIONS] [SSID]\n\n\
+         ARGS:\n    <SSID>    Wi-Fi network name (default: \"{DEFAULT_SSID}\")\n\n\
+         OPTIONS:\n\
+         \x20   -w, --watch            Stay running; re-auth whenever connectivity drops\n\
+         \x20   -i, --interval <SECS>  Watch poll interval in seconds (default: 60)\n\
+         \x20   -q, --quiet            Only log errors (overrides RUST_LOG)\n\
+         \x20   -h, --help             Print this help\n\n\
+         Log verbosity is otherwise controlled by RUST_LOG (e.g. RUST_LOG=debug)."
+    );
+}
 
-    println!("{right}Connecting to {ssid}...");
+fn parse_args_from<I: Iterator<Item = String>>(args: I) -> Result<Config, String> {
+    let mut ssid = None;
+    let mut watch = false;
+    let mut interval = Duration::from_secs(60);
+    let mut quiet = false;
+    let mut args = args.peekable();
 
-    let nmcli_up = Command::new("nmcli")
-        .args(["connection", "up", ssid])
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-w" | "--watch" => watch = true,
+            "-q" | "--quiet" => quiet = true,
+            "-h" | "--help" => {
+                print_help();
+                std::process::exit(0);
+            }
+            "-i" | "--interval" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| "--interval requires a value (seconds)".to_string())?;
+                let secs: u64 = val
+                    .parse()
+                    .map_err(|_| format!("invalid --interval value: {val}"))?;
+                if secs == 0 {
+                    return Err("--interval must be greater than 0".to_string());
+                }
+                interval = Duration::from_secs(secs);
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unknown option: {other}"));
+            }
+            other => ssid = Some(other.to_string()),
+        }
+    }
+
+    Ok(Config {
+        ssid: ssid.unwrap_or_else(|| DEFAULT_SSID.to_string()),
+        watch,
+        interval,
+        quiet,
+    })
+}
+
+fn init_logging(quiet: bool) {
+    let default_level = if quiet { "error" } else { "info" };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
+        .format_timestamp_secs()
+        .format_target(false)
+        .init();
+}
+
+/// RAII wrapper so the chromedriver child is always killed and reaped,
+/// on every exit path, instead of leaking a zombie.
+struct ChromeDriver {
+    child: Child,
+}
+
+impl ChromeDriver {
+    fn spawn(port: u16) -> std::io::Result<Self> {
+        let child = Command::new("chromedriver")
+            .arg(format!("--port={port}"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        Ok(Self { child })
+    }
+}
+
+impl Drop for ChromeDriver {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Grab an OS-assigned free port so parallel/leftover chromedrivers on the
+/// fixed 9515 don't make us fail to start.
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .ok()
+        .and_then(|l| l.local_addr().ok())
+        .map(|a| a.port())
+        .unwrap_or(9515)
+}
+
+/// Lightweight captive-portal check: a raw HTTP GET to a well-known
+/// `generate_204` endpoint. Real internet returns `204`; a captive portal
+/// intercepts with a `200`/redirect.
+fn is_online_blocking() -> bool {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+
+    let addr = match (CONNECTIVITY_HOST, 80).to_socket_addrs() {
+        Ok(mut it) => match it.next() {
+            Some(a) => a,
+            None => return false,
+        },
+        Err(_) => return false,
+    };
+    let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+
+    let req = format!(
+        "GET /generate_204 HTTP/1.0\r\nHost: {CONNECTIVITY_HOST}\r\nConnection: close\r\n\r\n"
+    );
+    if stream.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+
+    let mut buf = [0u8; 64];
+    match stream.read(&mut buf) {
+        Ok(n) => {
+            let head = String::from_utf8_lossy(&buf[..n]);
+            head.starts_with("HTTP/1.0 204") || head.starts_with("HTTP/1.1 204")
+        }
+        Err(_) => false,
+    }
+}
+
+async fn is_online() -> bool {
+    tokio::task::spawn_blocking(is_online_blocking)
+        .await
+        .unwrap_or(false)
+}
+
+/// Parse the currently-active SSID from `nmcli -t -f active,ssid dev wifi`.
+/// Splitting on the first `:` only (via `strip_prefix`) keeps SSIDs that
+/// themselves contain a colon intact.
+fn parse_active_ssid(nmcli_out: &str) -> Option<String> {
+    for line in nmcli_out.lines() {
+        if let Some(rest) = line.strip_prefix("yes:") {
+            return Some(rest.to_string());
+        }
+    }
+    None
+}
+
+fn active_ssid() -> Option<String> {
+    let out = Command::new("nmcli")
+        .args(["-t", "-f", "active,ssid", "dev", "wifi"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_active_ssid(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// (Re)connect to the Wi-Fi, forcing a fresh activation so NetworkManager rolls
+/// a new randomized MAC (`wifi.cloned-mac-address=random`). The new MAC is what
+/// lets us re-authenticate past the captive portal's per-device usage cap — the
+/// portal treats each MAC as a brand-new visitor.
+///
+/// Tries an existing saved profile first (`connection down` then `up`), then
+/// falls back to associating with an open network (`dev wifi connect`).
+fn connect_to_wifi(cfg: &Config) -> bool {
+    info!("Cycling '{}' to roll a fresh MAC...", cfg.ssid);
+
+    // Down first so `up` is a full re-activation and NM re-applies a new
+    // random MAC. Ignore failure here — the profile may already be down.
+    let _ = Command::new("nmcli")
+        .args(["connection", "down", &cfg.ssid])
         .output();
 
-    match nmcli_up {
-        Ok(output) if output.status.success() => {
-            println!("{right}Network command sent successfully...");
-        }
-        Ok(_) | Err(_) => {
-            eprintln!("{left}Failed to connect to WiFi: {ssid}!!!");
+    let up_ok = Command::new("nmcli")
+        .args(["connection", "up", &cfg.ssid])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if !up_ok {
+        let connect_ok = Command::new("nmcli")
+            .args(["dev", "wifi", "connect", &cfg.ssid])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !connect_ok {
+            error!("Failed to connect to Wi-Fi '{}'", cfg.ssid);
             return false;
         }
     }
 
-    let mut tries = 1;
-    while tries < 20 {
-        let result = Command::new("nmcli")
-            .args(["-t", "-f", "active,ssid", "dev", "wifi"])
-            .output();
-
-        if let Ok(output) = result
-            && output.status.success()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let mut current_ssid = String::new();
-            for line in stdout.lines() {
-                if line.starts_with("yes:") {
-                    let parts: Vec<&str> = line.split(':').collect();
-                    if parts.len() > 1 {
-                        current_ssid = parts[1].to_string();
-                    }
-                    break;
-                }
-            }
-
-            if current_ssid == ssid {
-                println!("{right}Connected after {tries} tries...");
-                return true;
-            }
+    for tries in 1..20 {
+        if active_ssid().as_deref() == Some(cfg.ssid.as_str()) {
+            info!("Connected after {tries} tries.");
+            return true;
         }
-
-        tries += 1;
         std::thread::sleep(Duration::from_millis(500));
     }
 
-    eprintln!("{left}Failed to connect to WiFi: {ssid}!!!");
+    error!(
+        "Associated command sent but '{}' never became active",
+        cfg.ssid
+    );
     false
+}
+
+/// Minimal HTML entity decode — enough to recover attribute values (notably the
+/// form `action` URL) from the Meraki splash page, whose markup is served
+/// HTML-escaped. `&amp;` is decoded last so we don't re-expand other entities.
+fn html_unescape(s: &str) -> String {
+    s.replace("&#x2F;", "/")
+        .replace("&#x2713;", "✓")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// First capture group of `pattern` in `haystack`, if it matches.
+fn capture(haystack: &str, pattern: &str) -> Option<String> {
+    regex::Regex::new(pattern)
+        .ok()?
+        .captures(haystack)?
+        .get(1)
+        .map(|m| m.as_str().to_string())
+}
+
+/// Isolate the `billing_pick` (free plan) `<form>…</form>` block so we read the
+/// authenticity token that belongs to *that* form, not the prepaid form which
+/// carries its own token.
+fn billing_pick_form(html: &str) -> Option<&str> {
+    let action = html.find("billing_pick")?;
+    let start = html[..action].rfind("<form")?;
+    let end = html[start..].find("</form>").map(|e| start + e)?;
+    Some(&html[start..end])
+}
+
+/// HTTP-only captive-portal login (the fast path). Mirrors what the browser
+/// does on the Cisco Meraki splash: GET a captive-detect URL (redirects to the
+/// splash, setting a session cookie), scrape the free form's Rails
+/// `authenticity_token`, then POST it. No browser, no chromedriver.
+///
+/// Returns whether the POST was accepted; the caller confirms real
+/// connectivity. Any parsing/network failure returns `false` (and logs a
+/// `warn!` if the markup looks like it changed) so we fall back to the browser.
+async fn http_login(detect_url: &str) -> bool {
+    let client = match reqwest::Client::builder()
+        .cookie_store(true)
+        .user_agent(BROWSER_UA)
+        .timeout(Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Could not build HTTP client: {e}");
+            return false;
+        }
+    };
+
+    // Follows the 307 to the splash page and picks up the session cookie.
+    let resp = match client.get(detect_url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Captive-detect request failed: {e}");
+            return false;
+        }
+    };
+    if resp.status().as_u16() == 204 {
+        return true; // already online
+    }
+
+    let final_url = resp.url().clone();
+    let html = match resp.text().await {
+        Ok(body) => html_unescape(&body),
+        Err(e) => {
+            warn!("Could not read splash page body: {e}");
+            return false;
+        }
+    };
+
+    let Some(form) = billing_pick_form(&html) else {
+        warn!(
+            "Splash page has no 'billing_pick' form — Meraki portal markup may have changed. \
+             Falling back to browser."
+        );
+        return false;
+    };
+
+    let Some(token) = capture(form, r#"name="authenticity_token"\s+value="([^"]+)""#) else {
+        warn!(
+            "'authenticity_token' not found in free-plan form — portal markup may have changed. \
+             Falling back to browser."
+        );
+        return false;
+    };
+    let continue_url =
+        capture(form, r#"name="continue_url"[^>]*value="([^"]*)""#).unwrap_or_default();
+    let post_url = capture(form, r#"action="([^"]*billing_pick[^"]*)""#)
+        .filter(|u| u.starts_with("http"))
+        .unwrap_or_else(|| {
+            format!(
+                "{}://{}/splash/billing_pick",
+                final_url.scheme(),
+                final_url.host_str().unwrap_or("network-auth.com")
+            )
+        });
+
+    info!("Submitting free-plan portal form over HTTP...");
+    let params = [
+        ("utf8", "✓"),
+        ("authenticity_token", token.as_str()),
+        ("pricing_plan", "free"),
+        ("commit", "Continue"),
+        ("continue_url", continue_url.as_str()),
+    ];
+    match client.post(&post_url).form(&params).send().await {
+        Ok(_) => true,
+        Err(e) => {
+            warn!("Portal POST failed: {e}");
+            false
+        }
+    }
+}
+
+/// Connect to a freshly spawned chromedriver, polling readiness instead of a
+/// fixed sleep so we don't race a slow startup (or wait longer than needed).
+async fn new_driver(port: u16) -> WebDriverResult<WebDriver> {
+    let url = format!("http://localhost:{port}");
+    let mut last_err = None;
+    for _ in 0..20 {
+        let mut caps = DesiredCapabilities::chrome();
+        caps.add_arg("--headless=new")?;
+        caps.add_arg("--no-sandbox")?;
+        caps.add_arg("--disable-dev-shm-usage")?;
+        match WebDriver::new(&url, caps).await {
+            Ok(driver) => return Ok(driver),
+            Err(e) => {
+                last_err = Some(e);
+                sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+    Err(last_err.expect("loop runs at least once"))
+}
+
+/// Drive the captive portal page: click the free-access radio, then submit.
+async fn run_portal_flow(driver: &WebDriver) -> bool {
+    info!("Navigating to trigger portal...");
+    if let Err(e) = driver.goto("http://google.com").await {
+        error!("Failed to navigate: {e}");
+        return false;
+    }
+
+    info!("Looking for free-plan radio button...");
+    let mut clicked_radio = false;
+    for _ in 0..15 {
+        if let Ok(radio) = driver.find(By::Id("option_free")).await
+            && radio.is_displayed().await.unwrap_or(false)
+            && radio.click().await.is_ok()
+        {
+            clicked_radio = true;
+            break;
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+    if !clicked_radio {
+        warn!("Radio '#option_free' not found/clickable — portal markup may have changed.");
+        return false;
+    }
+
+    sleep(Duration::from_secs(1)).await;
+
+    info!("Looking for submit button...");
+    for _ in 0..15 {
+        if let Ok(submit) = driver.find(By::Name("commit")).await
+            && submit.is_displayed().await.unwrap_or(false)
+            && submit.click().await.is_ok()
+        {
+            info!("Portal submitted via browser.");
+            return true;
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+
+    warn!("Submit button [name=commit] not found/clickable — portal markup may have changed.");
+    false
+}
+
+/// Launch chromedriver + a headless browser and run the portal flow. The
+/// chromedriver process is cleaned up via `ChromeDriver`'s `Drop`, so every
+/// early return still reaps it.
+async fn authenticate_portal() -> bool {
+    let port = free_port();
+    let _driver_proc = match ChromeDriver::spawn(port) {
+        Ok(proc) => proc,
+        Err(e) => {
+            error!("Failed to start chromedriver ({e}). Is it installed and in PATH?");
+            return false;
+        }
+    };
+
+    let driver = match new_driver(port).await {
+        Ok(driver) => driver,
+        Err(e) => {
+            error!("Failed to connect to webdriver: {e}");
+            return false;
+        }
+    };
+
+    let result = run_portal_flow(&driver).await;
+    let _ = driver.quit().await;
+    result
+}
+
+/// Poll connectivity a few times, giving the portal a moment to let us through.
+async fn wait_online() -> bool {
+    for _ in 0..6 {
+        if is_online().await {
+            return true;
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+    false
+}
+
+/// One reconciliation pass: if already online, do nothing. Otherwise reconnect
+/// — which rolls a fresh MAC (see `connect_to_wifi`) so the portal treats us as
+/// a new device — then authenticate: try the fast HTTP path first, falling back
+/// to the browser if it doesn't take.
+async fn reconcile(cfg: &Config) -> bool {
+    if is_online().await {
+        info!("Already online — nothing to do.");
+        return true;
+    }
+
+    if !connect_to_wifi(cfg) {
+        return false;
+    }
+
+    // A fresh association occasionally restores connectivity on its own
+    // (e.g. an open network with no portal); skip auth if so.
+    if is_online().await {
+        info!("Online after associating.");
+        return true;
+    }
+
+    info!("Authenticating via HTTP fast path...");
+    if http_login(CAPTIVE_DETECT_URL).await && wait_online().await {
+        info!("Online — portal authenticated over HTTP.");
+        return true;
+    }
+
+    info!("HTTP path did not take — falling back to browser.");
+    let _ = authenticate_portal().await;
+    if wait_online().await {
+        info!("Online — portal authenticated via browser.");
+        true
+    } else {
+        error!("Still offline after browser fallback.");
+        false
+    }
+}
+
+/// Exponential backoff for watch mode: `interval * 2^(fails-1)`, capped.
+fn backoff_delay(base: Duration, fails: u32) -> Duration {
+    let shift = fails.saturating_sub(1).min(16);
+    let secs = base.as_secs().saturating_mul(1u64 << shift);
+    Duration::from_secs(secs).min(MAX_BACKOFF)
+}
+
+/// Sleep for `dur`, but wake early and return `true` if a shutdown signal
+/// (SIGTERM / Ctrl-C) arrives — so `systemctl stop` exits promptly.
+async fn sleep_or_shutdown(dur: Duration, sigterm: Option<&mut Signal>) -> bool {
+    match sigterm {
+        Some(sig) => tokio::select! {
+            _ = sleep(dur) => false,
+            _ = sig.recv() => true,
+            _ = tokio::signal::ctrl_c() => true,
+        },
+        None => tokio::select! {
+            _ = sleep(dur) => false,
+            _ = tokio::signal::ctrl_c() => true,
+        },
+    }
+}
+
+async fn run_watch(cfg: &Config) {
+    info!(
+        "Watch mode: keeping '{}' online, checking every {}s.",
+        cfg.ssid,
+        cfg.interval.as_secs()
+    );
+
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            warn!("Could not install SIGTERM handler ({e}); Ctrl-C still works.");
+            None
+        }
+    };
+
+    let mut consecutive_failures = 0u32;
+    loop {
+        // `||` short-circuits: reconcile only runs when we're actually offline.
+        let delay = if is_online().await || reconcile(cfg).await {
+            consecutive_failures = 0;
+            cfg.interval
+        } else {
+            consecutive_failures += 1;
+            let backoff = backoff_delay(cfg.interval, consecutive_failures);
+            warn!(
+                "Reconcile failed ({consecutive_failures}x) — backing off {}s.",
+                backoff.as_secs()
+            );
+            backoff
+        };
+
+        if sleep_or_shutdown(delay, sigterm.as_mut()).await {
+            info!("Shutdown signal received — exiting watch loop.");
+            break;
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let cfg = match parse_args_from(env::args().skip(1)) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("error: {e}\n");
+            print_help();
+            std::process::exit(2);
+        }
+    };
+
+    init_logging(cfg.quiet);
+
+    if cfg.watch {
+        run_watch(&cfg).await;
+    } else {
+        std::process::exit(if reconcile(&cfg).await { 0 } else { 1 });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_from(args: &[&str]) -> Result<Config, String> {
+        parse_args_from(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn defaults_when_no_args() {
+        let cfg = cfg_from(&[]).unwrap();
+        assert_eq!(cfg.ssid, DEFAULT_SSID);
+        assert!(!cfg.watch);
+        assert!(!cfg.quiet);
+        assert_eq!(cfg.interval, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn parses_ssid_and_flags() {
+        let cfg = cfg_from(&["--watch", "-q", "-i", "30", "My Cafe"]).unwrap();
+        assert_eq!(cfg.ssid, "My Cafe");
+        assert!(cfg.watch);
+        assert!(cfg.quiet);
+        assert_eq!(cfg.interval, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn rejects_bad_interval() {
+        assert!(cfg_from(&["-i", "0"]).is_err());
+        assert!(cfg_from(&["-i", "abc"]).is_err());
+        assert!(cfg_from(&["--interval"]).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_flag() {
+        assert!(cfg_from(&["--nope"]).is_err());
+    }
+
+    #[test]
+    fn active_ssid_keeps_colons() {
+        let out = "no:HomeNet\nyes:My:Weird:SSID\nno:Other\n";
+        assert_eq!(parse_active_ssid(out), Some("My:Weird:SSID".to_string()));
+    }
+
+    #[test]
+    fn active_ssid_none_when_disconnected() {
+        assert_eq!(parse_active_ssid("no:A\nno:B\n"), None);
+    }
+
+    #[test]
+    fn unescape_recovers_action_url() {
+        let s = "action=\"https:&#x2F;&#x2F;n747.network-auth.com&#x2F;splash&#x2F;billing_pick\"";
+        assert!(html_unescape(s).contains("https://n747.network-auth.com/splash/billing_pick"));
+    }
+
+    // Two forms, each with its own token; we must read the free form's token
+    // even though the prepaid form appears first.
+    const SAMPLE_SPLASH: &str = r#"
+        <form action="https://n747.network-auth.com/splash/billing_prepaid" method="post">
+        <input type="hidden" name="authenticity_token" value="PREPAID_TOKEN" />
+        <input type="text" name="prepaid_card" />
+        </form>
+        <form action="https://n747.network-auth.com/splash/billing_pick" method="post">
+        <input name="utf8" type="hidden" value="✓" />
+        <input type="hidden" name="authenticity_token" value="FREE+tok/123==" />
+        <input type="radio" name="pricing_plan" id="option_free" value="free" />
+        <input type="hidden" name="continue_url" id="continue_url" value="https%3A%2F%2Fwww.starbucks.ph%2F" />
+        </form>
+    "#;
+
+    #[test]
+    fn billing_pick_form_scopes_to_free_form() {
+        let form = billing_pick_form(SAMPLE_SPLASH).unwrap();
+        assert!(form.contains("billing_pick"));
+        assert!(!form.contains("PREPAID_TOKEN"));
+        assert_eq!(
+            capture(form, r#"name="authenticity_token"\s+value="([^"]+)""#),
+            Some("FREE+tok/123==".to_string())
+        );
+        assert_eq!(
+            capture(form, r#"name="continue_url"[^>]*value="([^"]*)""#),
+            Some("https%3A%2F%2Fwww.starbucks.ph%2F".to_string())
+        );
+    }
+
+    #[test]
+    fn backoff_grows_then_caps() {
+        let base = Duration::from_secs(60);
+        assert_eq!(backoff_delay(base, 1), Duration::from_secs(60));
+        assert_eq!(backoff_delay(base, 2), Duration::from_secs(120));
+        assert_eq!(backoff_delay(base, 3), Duration::from_secs(240));
+        assert_eq!(backoff_delay(base, 4), Duration::from_secs(480));
+        // 60 * 2^4 = 960 -> capped at 900
+        assert_eq!(backoff_delay(base, 5), MAX_BACKOFF);
+        assert_eq!(backoff_delay(base, 99), MAX_BACKOFF);
+    }
+
+    // End-to-end exercise of the HTTP fast path against a mock Meraki splash:
+    // captive-detect -> 307 -> splash HTML -> scrape free-form token -> POST.
+    #[tokio::test]
+    async fn http_login_drives_full_flow() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let base = server.uri();
+
+        // Captive detect redirects to the splash page.
+        Mock::given(method("GET"))
+            .and(path("/generate_204"))
+            .respond_with(
+                ResponseTemplate::new(307).insert_header("location", format!("{base}/splash")),
+            )
+            .mount(&server)
+            .await;
+
+        // Splash: prepaid form first (its own token), then the free form.
+        let html = format!(
+            r#"<form action="{base}/splash/billing_prepaid" method="post">
+                 <input type="hidden" name="authenticity_token" value="PREPAID_TOKEN" />
+               </form>
+               <form action="{base}/splash/billing_pick" method="post">
+                 <input name="utf8" type="hidden" value="✓" />
+                 <input type="hidden" name="authenticity_token" value="FREE_TOKEN" />
+                 <input type="radio" name="pricing_plan" id="option_free" value="free" />
+                 <input type="hidden" name="continue_url" value="https%3A%2F%2Fexample%2F" />
+               </form>"#
+        );
+        Mock::given(method("GET"))
+            .and(path("/splash"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(html))
+            .mount(&server)
+            .await;
+
+        // POST must carry the FREE form's token and the free plan.
+        Mock::given(method("POST"))
+            .and(path("/splash/billing_pick"))
+            .and(body_string_contains("authenticity_token=FREE_TOKEN"))
+            .and(body_string_contains("pricing_plan=free"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ok = http_login(&format!("{base}/generate_204")).await;
+        assert!(ok, "http_login should complete the mock portal flow");
+        // MockServer's Drop verifies the POST expectation (exactly 1 hit with
+        // the right token + plan), so a wrong token would fail the test.
+    }
 }
