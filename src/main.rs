@@ -3,10 +3,10 @@ use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use log::{error, info, warn};
 use thirtyfour::prelude::*;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::time::sleep;
+use tracing::{debug, error, info, warn};
 
 const DEFAULT_SSID: &str = "Starbucks Customer";
 const CONNECTIVITY_HOST: &str = "connectivitycheck.gstatic.com";
@@ -90,10 +90,17 @@ fn parse_args_from<I: Iterator<Item = String>>(args: I) -> Result<Config, String
 }
 
 fn init_logging(quiet: bool) {
-    let default_level = if quiet { "error" } else { "info" };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
-        .format_timestamp_secs()
-        .format_target(false)
+    // --quiet forces error-only and ignores RUST_LOG; otherwise RUST_LOG wins,
+    // defaulting to info.
+    let filter = if quiet {
+        tracing_subscriber::EnvFilter::new("error")
+    } else {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
         .init();
 }
 
@@ -236,7 +243,7 @@ async fn confirmed_offline() -> bool {
 /// Tries an existing saved profile first (`connection down` then `up`), then
 /// falls back to associating with an open network (`dev wifi connect`).
 fn connect_to_wifi(cfg: &Config) -> bool {
-    info!("Cycling '{}' to roll a fresh MAC...", cfg.ssid);
+    info!(ssid = %cfg.ssid, "cycling connection for fresh MAC");
 
     // Down first so `up` is a full re-activation and NM re-applies a new
     // random MAC. Ignore failure here — the profile may already be down.
@@ -257,23 +264,20 @@ fn connect_to_wifi(cfg: &Config) -> bool {
             .map(|o| o.status.success())
             .unwrap_or(false);
         if !connect_ok {
-            error!("Failed to connect to Wi-Fi '{}'", cfg.ssid);
+            error!(ssid = %cfg.ssid, "failed to connect to Wi-Fi");
             return false;
         }
     }
 
     for tries in 1..20 {
         if active_ssid().as_deref() == Some(cfg.ssid.as_str()) {
-            info!("Connected after {tries} tries.");
+            info!(tries, "associated");
             return true;
         }
         std::thread::sleep(Duration::from_millis(500));
     }
 
-    error!(
-        "Associated command sent but '{}' never became active",
-        cfg.ssid
-    );
+    error!(ssid = %cfg.ssid, "association never became active");
     false
 }
 
@@ -326,7 +330,7 @@ async fn http_login(detect_url: &str) -> bool {
     {
         Ok(c) => c,
         Err(e) => {
-            warn!("Could not build HTTP client: {e}");
+            warn!(error = %e, "could not build HTTP client");
             return false;
         }
     };
@@ -335,7 +339,7 @@ async fn http_login(detect_url: &str) -> bool {
     let resp = match client.get(detect_url).send().await {
         Ok(r) => r,
         Err(e) => {
-            warn!("Captive-detect request failed: {e}");
+            warn!(error = %e, "captive-detect request failed");
             return false;
         }
     };
@@ -347,23 +351,21 @@ async fn http_login(detect_url: &str) -> bool {
     let html = match resp.text().await {
         Ok(body) => html_unescape(&body),
         Err(e) => {
-            warn!("Could not read splash page body: {e}");
+            warn!(error = %e, "could not read splash page body");
             return false;
         }
     };
 
     let Some(form) = billing_pick_form(&html) else {
         warn!(
-            "Splash page has no 'billing_pick' form — Meraki portal markup may have changed. \
-             Falling back to browser."
+            "no billing_pick form on splash; portal markup may have changed, falling back to browser"
         );
         return false;
     };
 
     let Some(token) = capture(form, r#"name="authenticity_token"\s+value="([^"]+)""#) else {
         warn!(
-            "'authenticity_token' not found in free-plan form — portal markup may have changed. \
-             Falling back to browser."
+            "authenticity_token missing in free-plan form; portal markup may have changed, falling back to browser"
         );
         return false;
     };
@@ -379,7 +381,7 @@ async fn http_login(detect_url: &str) -> bool {
             )
         });
 
-    info!("Submitting free-plan portal form over HTTP...");
+    debug!(url = %post_url, "submitting free-plan portal form");
     let params = [
         ("utf8", "✓"),
         ("authenticity_token", token.as_str()),
@@ -419,13 +421,13 @@ async fn new_driver(port: u16) -> WebDriverResult<WebDriver> {
 
 /// Drive the captive portal page: click the free-access radio, then submit.
 async fn run_portal_flow(driver: &WebDriver) -> bool {
-    info!("Navigating to trigger portal...");
+    debug!("driving portal page");
     if let Err(e) = driver.goto("http://google.com").await {
-        error!("Failed to navigate: {e}");
+        error!(error = %e, "failed to navigate to portal");
         return false;
     }
 
-    info!("Looking for free-plan radio button...");
+    debug!("locating free-plan radio");
     let mut clicked_radio = false;
     for _ in 0..15 {
         if let Ok(radio) = driver.find(By::Id("option_free")).await
@@ -438,25 +440,25 @@ async fn run_portal_flow(driver: &WebDriver) -> bool {
         sleep(Duration::from_secs(1)).await;
     }
     if !clicked_radio {
-        warn!("Radio '#option_free' not found/clickable — portal markup may have changed.");
+        warn!("radio #option_free not found; portal markup may have changed");
         return false;
     }
 
     sleep(Duration::from_secs(1)).await;
 
-    info!("Looking for submit button...");
+    debug!("locating submit button");
     for _ in 0..15 {
         if let Ok(submit) = driver.find(By::Name("commit")).await
             && submit.is_displayed().await.unwrap_or(false)
             && submit.click().await.is_ok()
         {
-            info!("Portal submitted via browser.");
+            debug!("submitted portal form via browser");
             return true;
         }
         sleep(Duration::from_secs(1)).await;
     }
 
-    warn!("Submit button [name=commit] not found/clickable — portal markup may have changed.");
+    warn!("submit button [name=commit] not found; portal markup may have changed");
     false
 }
 
@@ -468,7 +470,7 @@ async fn authenticate_portal() -> bool {
     let _driver_proc = match ChromeDriver::spawn(port) {
         Ok(proc) => proc,
         Err(e) => {
-            error!("Failed to start chromedriver ({e}). Is it installed and in PATH?");
+            error!(error = %e, "failed to start chromedriver; is it installed and in PATH?");
             return false;
         }
     };
@@ -476,7 +478,7 @@ async fn authenticate_portal() -> bool {
     let driver = match new_driver(port).await {
         Ok(driver) => driver,
         Err(e) => {
-            error!("Failed to connect to webdriver: {e}");
+            error!(error = %e, "failed to connect to webdriver");
             return false;
         }
     };
@@ -503,7 +505,7 @@ async fn wait_online() -> bool {
 /// to the browser if it doesn't take.
 async fn reconcile(cfg: &Config) -> bool {
     if is_online().await {
-        info!("Already online — nothing to do.");
+        info!("already online");
         return true;
     }
 
@@ -511,10 +513,7 @@ async fn reconcile(cfg: &Config) -> bool {
     // SSID is actually in range. Off-site (e.g. home Wi-Fi) this makes us a
     // no-op instead of dropping the current connection to hunt for Starbucks.
     if !ssid_in_range(&cfg.ssid) {
-        info!(
-            "Offline, but '{}' is not in range — leaving the current network alone.",
-            cfg.ssid
-        );
+        info!(ssid = %cfg.ssid, "offline but target SSID not in range; leaving current network alone");
         return false;
     }
 
@@ -525,23 +524,23 @@ async fn reconcile(cfg: &Config) -> bool {
     // A fresh association occasionally restores connectivity on its own
     // (e.g. an open network with no portal); skip auth if so.
     if is_online().await {
-        info!("Online after associating.");
+        info!("online after associating");
         return true;
     }
 
-    info!("Authenticating via HTTP fast path...");
+    info!("authenticating over HTTP");
     if http_login(CAPTIVE_DETECT_URL).await && wait_online().await {
-        info!("Online — portal authenticated over HTTP.");
+        info!(method = "http", "authenticated");
         return true;
     }
 
-    info!("HTTP path did not take — falling back to browser.");
+    info!("HTTP auth did not take; falling back to browser");
     let _ = authenticate_portal().await;
     if wait_online().await {
-        info!("Online — portal authenticated via browser.");
+        info!(method = "browser", "authenticated");
         true
     } else {
-        error!("Still offline after browser fallback.");
+        error!("still offline after browser fallback");
         false
     }
 }
@@ -570,16 +569,12 @@ async fn sleep_or_shutdown(dur: Duration, sigterm: Option<&mut Signal>) -> bool 
 }
 
 async fn run_watch(cfg: &Config) {
-    info!(
-        "Watch mode: keeping '{}' online, checking every {}s.",
-        cfg.ssid,
-        cfg.interval.as_secs()
-    );
+    info!(ssid = %cfg.ssid, interval_s = cfg.interval.as_secs(), "watching");
 
     let mut sigterm = match signal(SignalKind::terminate()) {
         Ok(s) => Some(s),
         Err(e) => {
-            warn!("Could not install SIGTERM handler ({e}); Ctrl-C still works.");
+            warn!(error = %e, "no SIGTERM handler; Ctrl-C still works");
             None
         }
     };
@@ -595,14 +590,15 @@ async fn run_watch(cfg: &Config) {
             consecutive_failures += 1;
             let backoff = backoff_delay(cfg.interval, consecutive_failures);
             warn!(
-                "Reconcile failed ({consecutive_failures}x) — backing off {}s.",
-                backoff.as_secs()
+                failures = consecutive_failures,
+                backoff_s = backoff.as_secs(),
+                "reconcile failed; backing off"
             );
             backoff
         };
 
         if sleep_or_shutdown(delay, sigterm.as_mut()).await {
-            info!("Shutdown signal received — exiting watch loop.");
+            info!("shutdown signal received; exiting");
             break;
         }
     }
