@@ -193,6 +193,36 @@ fn active_ssid() -> Option<String> {
     parse_active_ssid(&String::from_utf8_lossy(&out.stdout))
 }
 
+/// Whether `ssid` appears in an `nmcli -t -f ssid dev wifi list` dump.
+fn ssid_in_scan(scan: &str, ssid: &str) -> bool {
+    scan.lines().any(|line| line == ssid)
+}
+
+/// Is the target SSID currently in range? Used to gate reconnection so the
+/// service never yanks the radio off another network (e.g. home Wi-Fi) hunting
+/// for a Starbucks AP that isn't there.
+fn ssid_in_range(ssid: &str) -> bool {
+    Command::new("nmcli")
+        .args(["-t", "-f", "ssid", "dev", "wifi", "list"])
+        .output()
+        .map(|o| ssid_in_scan(&String::from_utf8_lossy(&o.stdout), ssid))
+        .unwrap_or(false)
+}
+
+/// Declare offline only after several consecutive failed probes, so a single
+/// transient blip does not trigger a needless (and disruptive) reconnect.
+async fn confirmed_offline() -> bool {
+    for i in 0..3 {
+        if is_online().await {
+            return false;
+        }
+        if i < 2 {
+            sleep(Duration::from_secs(2)).await;
+        }
+    }
+    true
+}
+
 /// (Re)connect to the Wi-Fi, forcing a fresh activation so NetworkManager rolls
 /// a new randomized MAC (`wifi.cloned-mac-address=random`). The new MAC is what
 /// lets us re-authenticate past the captive portal's per-device usage cap — the
@@ -472,6 +502,17 @@ async fn reconcile(cfg: &Config) -> bool {
         return true;
     }
 
+    // Don't hijack whatever network we're on: only reconnect if the target
+    // SSID is actually in range. Off-site (e.g. home Wi-Fi) this makes us a
+    // no-op instead of dropping the current connection to hunt for Starbucks.
+    if !ssid_in_range(&cfg.ssid) {
+        info!(
+            "Offline, but '{}' is not in range — leaving the current network alone.",
+            cfg.ssid
+        );
+        return false;
+    }
+
     if !connect_to_wifi(cfg) {
         return false;
     }
@@ -540,8 +581,9 @@ async fn run_watch(cfg: &Config) {
 
     let mut consecutive_failures = 0u32;
     loop {
-        // `||` short-circuits: reconcile only runs when we're actually offline.
-        let delay = if is_online().await || reconcile(cfg).await {
+        // `||` short-circuits: reconcile only runs after we've confirmed we're
+        // actually offline (several failed probes), not on a single blip.
+        let delay = if !confirmed_offline().await || reconcile(cfg).await {
             consecutive_failures = 0;
             cfg.interval
         } else {
@@ -628,6 +670,14 @@ mod tests {
     #[test]
     fn active_ssid_none_when_disconnected() {
         assert_eq!(parse_active_ssid("no:A\nno:B\n"), None);
+    }
+
+    #[test]
+    fn ssid_in_scan_matches_exact_line() {
+        let scan = "HomeNet\nStarbucks Customer\nCoffeeGuest\n";
+        assert!(ssid_in_scan(scan, "Starbucks Customer"));
+        assert!(!ssid_in_scan(scan, "Starbucks"));
+        assert!(!ssid_in_scan("", "Starbucks Customer"));
     }
 
     #[test]
