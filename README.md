@@ -73,11 +73,17 @@ are cheap.
 
 Captive-portal sessions expire on the venue's clock. Watch mode keeps you
 authenticated by polling connectivity and re-running the portal login only when
-it drops:
+it drops. Run it in a terminal while you are at the café and stop it (Ctrl-C)
+when you leave:
 
 ```bash
 starbypass --watch --interval 60 "Starbucks Customer"
 ```
+
+It only reconnects when it confirms it is offline (several failed probes, so a
+momentary blip does not trigger a needless reconnect) **and** the target SSID is
+in range. If you walk away and forget to stop it, it leaves whatever network you
+join next alone instead of hunting for the Starbucks AP.
 
 ### How re-auth works (MAC rotation)
 
@@ -96,20 +102,6 @@ brand-new device and grants a new session, which the browser flow accepts. This
 is why it can re-authenticate indefinitely — each pass looks like a different
 device. Without `cloned-mac-address=random`, re-auth on the same (already
 capped) MAC would be rejected.
-
-#### Run it as a service
-
-A ready-made systemd user unit lives at
-[`packaging/starbypass.service`](packaging/starbypass.service):
-
-```bash
-mkdir -p ~/.config/systemd/user
-cp packaging/starbypass.service ~/.config/systemd/user/
-# edit ExecStart if your binary path or SSID differ
-systemctl --user daemon-reload
-systemctl --user enable --now starbypass.service
-sudo loginctl enable-linger "$USER"   # so it runs without an active login
-```
 
 ## License
 
