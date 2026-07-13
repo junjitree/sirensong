@@ -1,9 +1,7 @@
 use std::env;
-use std::net::TcpListener;
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::time::Duration;
 
-use thirtyfour::prelude::*;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
@@ -102,40 +100,6 @@ fn init_logging(quiet: bool) {
         .with_env_filter(filter)
         .with_target(false)
         .init();
-}
-
-/// RAII wrapper so the chromedriver child is always killed and reaped,
-/// on every exit path, instead of leaking a zombie.
-struct ChromeDriver {
-    child: Child,
-}
-
-impl ChromeDriver {
-    fn spawn(port: u16) -> std::io::Result<Self> {
-        let child = Command::new("chromedriver")
-            .arg(format!("--port={port}"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-        Ok(Self { child })
-    }
-}
-
-impl Drop for ChromeDriver {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-/// Grab an OS-assigned free port so parallel/leftover chromedrivers on the
-/// fixed 9515 don't make us fail to start.
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .ok()
-        .and_then(|l| l.local_addr().ok())
-        .map(|a| a.port())
-        .unwrap_or(9515)
 }
 
 /// Lightweight captive-portal check: a raw HTTP GET to a well-known
@@ -398,96 +362,6 @@ async fn http_login(detect_url: &str) -> bool {
     }
 }
 
-/// Connect to a freshly spawned chromedriver, polling readiness instead of a
-/// fixed sleep so we don't race a slow startup (or wait longer than needed).
-async fn new_driver(port: u16) -> WebDriverResult<WebDriver> {
-    let url = format!("http://localhost:{port}");
-    let mut last_err = None;
-    for _ in 0..20 {
-        let mut caps = DesiredCapabilities::chrome();
-        caps.add_arg("--headless=new")?;
-        caps.add_arg("--no-sandbox")?;
-        caps.add_arg("--disable-dev-shm-usage")?;
-        match WebDriver::new(&url, caps).await {
-            Ok(driver) => return Ok(driver),
-            Err(e) => {
-                last_err = Some(e);
-                sleep(Duration::from_millis(250)).await;
-            }
-        }
-    }
-    Err(last_err.expect("loop runs at least once"))
-}
-
-/// Drive the captive portal page: click the free-access radio, then submit.
-async fn run_portal_flow(driver: &WebDriver) -> bool {
-    debug!("driving portal page");
-    if let Err(e) = driver.goto("http://google.com").await {
-        error!(error = %e, "failed to navigate to portal");
-        return false;
-    }
-
-    debug!("locating free-plan radio");
-    let mut clicked_radio = false;
-    for _ in 0..15 {
-        if let Ok(radio) = driver.find(By::Id("option_free")).await
-            && radio.is_displayed().await.unwrap_or(false)
-            && radio.click().await.is_ok()
-        {
-            clicked_radio = true;
-            break;
-        }
-        sleep(Duration::from_secs(1)).await;
-    }
-    if !clicked_radio {
-        warn!("radio #option_free not found; portal markup may have changed");
-        return false;
-    }
-
-    sleep(Duration::from_secs(1)).await;
-
-    debug!("locating submit button");
-    for _ in 0..15 {
-        if let Ok(submit) = driver.find(By::Name("commit")).await
-            && submit.is_displayed().await.unwrap_or(false)
-            && submit.click().await.is_ok()
-        {
-            debug!("submitted portal form via browser");
-            return true;
-        }
-        sleep(Duration::from_secs(1)).await;
-    }
-
-    warn!("submit button [name=commit] not found; portal markup may have changed");
-    false
-}
-
-/// Launch chromedriver + a headless browser and run the portal flow. The
-/// chromedriver process is cleaned up via `ChromeDriver`'s `Drop`, so every
-/// early return still reaps it.
-async fn authenticate_portal() -> bool {
-    let port = free_port();
-    let _driver_proc = match ChromeDriver::spawn(port) {
-        Ok(proc) => proc,
-        Err(e) => {
-            error!(error = %e, "failed to start chromedriver; is it installed and in PATH?");
-            return false;
-        }
-    };
-
-    let driver = match new_driver(port).await {
-        Ok(driver) => driver,
-        Err(e) => {
-            error!(error = %e, "failed to connect to webdriver");
-            return false;
-        }
-    };
-
-    let result = run_portal_flow(&driver).await;
-    let _ = driver.quit().await;
-    result
-}
-
 /// Poll connectivity a few times, giving the portal a moment to let us through.
 async fn wait_online() -> bool {
     for _ in 0..6 {
@@ -501,8 +375,7 @@ async fn wait_online() -> bool {
 
 /// One reconciliation pass: if already online, do nothing. Otherwise reconnect
 /// — which rolls a fresh MAC (see `connect_to_wifi`) so the portal treats us as
-/// a new device — then authenticate: try the fast HTTP path first, falling back
-/// to the browser if it doesn't take.
+/// a new device — then authenticate over HTTP against the captive portal.
 async fn reconcile(cfg: &Config) -> bool {
     if is_online().await {
         info!("already online");
@@ -531,16 +404,9 @@ async fn reconcile(cfg: &Config) -> bool {
     info!("authenticating over HTTP");
     if http_login(CAPTIVE_DETECT_URL).await && wait_online().await {
         info!(method = "http", "authenticated");
-        return true;
-    }
-
-    info!("HTTP auth did not take; falling back to browser");
-    let _ = authenticate_portal().await;
-    if wait_online().await {
-        info!(method = "browser", "authenticated");
         true
     } else {
-        error!("still offline after browser fallback");
+        error!("HTTP authentication failed");
         false
     }
 }

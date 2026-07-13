@@ -1,15 +1,13 @@
 # SirenSong
 
 SirenSong answers the Starbucks siren's call for you — it automates login to
-Starbucks Wi-Fi captive portals. It authenticates over plain HTTP (falling back
-to a headless browser) and rolls a fresh MAC address on each reconnect, so the
-portal's per-device time limit never runs out.
+Starbucks Wi-Fi captive portals. It authenticates over plain HTTP and rolls a
+fresh MAC address on each reconnect, so the portal's per-device time limit never
+runs out.
 
 ## Prerequisites
 
 - `nmcli` (NetworkManager command-line tool)
-- Google Chrome
-- ChromeDriver (installed and in your `PATH`)
 - Rust and Cargo
 
 ## Installation
@@ -69,9 +67,8 @@ sirensong [OPTIONS] [SSID]
   -h, --help             Print help
 ```
 
-Before launching a browser, sirensong does a lightweight `generate_204`
-connectivity check and exits early if you are already online, so repeated runs
-are cheap.
+Before doing anything, sirensong runs a lightweight `generate_204` connectivity
+check and exits early if you are already online, so repeated runs are cheap.
 
 ### Watch mode (default)
 
@@ -104,8 +101,8 @@ wifi.cloned-mac-address=random
 
 When connectivity drops, SirenSong **cycles the connection down and back up**,
 which makes NetworkManager roll a fresh random MAC. The portal then sees a
-brand-new device and grants a new session, which the browser flow accepts. This
-is why it can re-authenticate indefinitely — each pass looks like a different
+brand-new device and grants a new session, which the HTTP login claims. This is
+why it can re-authenticate indefinitely — each pass looks like a different
 device. Without `cloned-mac-address=random`, re-auth on the same (already
 capped) MAC would be rejected.
 
