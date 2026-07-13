@@ -108,6 +108,13 @@ is why it can re-authenticate indefinitely — each pass looks like a different
 device. Without `cloned-mac-address=random`, re-auth on the same (already
 capped) MAC would be rejected.
 
+## Disclaimer
+
+This is a personal automation/educational project. The MAC randomization
+deliberately resets the captive portal's per-device usage allowance. Use it on
+networks you are authorized to use and respect the venue's terms of service and
+any applicable acceptable-use policies. You are responsible for how you use it.
+
 ## License
 
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file
