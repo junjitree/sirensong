@@ -37,7 +37,8 @@ fn print_help() {
          \x20   -o, --once             Authenticate once and exit (default: watch and re-auth on drop)\n\
          \x20   -i, --interval <SECS>  Watch poll interval in seconds (default: 60)\n\
          \x20   -q, --quiet            Only log errors (overrides RUST_LOG)\n\
-         \x20   -h, --help             Print this help\n\n\
+         \x20   -h, --help             Print this help\n\
+         \x20   -V, --version          Print version\n\n\
          Log verbosity is otherwise controlled by RUST_LOG (e.g. RUST_LOG=debug)."
     );
 }
@@ -55,6 +56,10 @@ fn parse_args_from<I: Iterator<Item = String>>(args: I) -> Result<Config, String
             "-q" | "--quiet" => quiet = true,
             "-h" | "--help" => {
                 print_help();
+                std::process::exit(0);
+            }
+            "-V" | "--version" => {
+                println!("starbypass {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             "-i" | "--interval" => {
