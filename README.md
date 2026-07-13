@@ -1,26 +1,14 @@
 # StarBypass
 
 StarBypass automates the process of connecting to Starbucks Wi-Fi captive
-portals. It uses Selenium to simulate a user clicking "Accept" on the terms and
+portals. It drives a headless browser to click "Accept" on the terms and
 conditions page.
 
-Two versions are available: a Python script and a Rust application.
-
 ## Prerequisites
-
-Both versions require:
 
 - `nmcli` (NetworkManager command-line tool)
 - Google Chrome
 - ChromeDriver (installed and in your `PATH`)
-
-### Python Version
-
-- Python 3
-- `selenium` library
-
-### Rust Version
-
 - Rust and Cargo
 
 ## Installation
@@ -32,17 +20,7 @@ Both versions require:
    cd starbypass
    ```
 
-### Python Setup
-
-Install the required Python libraries:
-
-```bash
-pip install selenium
-```
-
-### Rust Setup
-
-The Rust version can be built using Cargo:
+2. Build with Cargo:
 
 ```bash
 cargo build --release
@@ -55,23 +33,6 @@ cargo install --path .
 ```
 
 ## Usage
-
-### Python
-
-Run the script:
-
-```bash
-python bypass.py [SSID]
-```
-
-By default, the script will attempt to connect to the "Starbucks Customer" Wi-Fi
-network. You can specify a different SSID as an argument:
-
-```bash
-python bypass.py "My Custom SSID"
-```
-
-### Rust
 
 If you installed the binary using `cargo install`, you can run it directly:
 
@@ -91,8 +52,64 @@ Or run the compiled binary:
 ./target/release/starbypass [SSID]
 ```
 
-Like the Python version, it defaults to "Starbucks Customer" if no SSID is
-provided.
+It defaults to "Starbucks Customer" if no SSID is provided.
+
+### Options
+
+```
+starbypass [OPTIONS] [SSID]
+
+  -w, --watch            Stay running; re-auth whenever connectivity drops
+  -i, --interval <SECS>  Watch poll interval in seconds (default: 60)
+  -q, --quiet            Suppress status output (errors still print)
+  -h, --help             Print help
+```
+
+Before launching a browser, starbypass does a lightweight `generate_204`
+connectivity check and exits early if you are already online, so repeated runs
+are cheap.
+
+### Watch mode
+
+Captive-portal sessions expire on the venue's clock. Watch mode keeps you
+authenticated by polling connectivity and re-running the portal login only when
+it drops:
+
+```bash
+starbypass --watch --interval 60 "Starbucks Customer"
+```
+
+### How re-auth works (MAC rotation)
+
+Captive portals cap usage **per device (MAC address)**. StarBypass relies on
+NetworkManager being configured to randomize the MAC on each connection —
+
+```ini
+# /etc/NetworkManager/NetworkManager.conf
+[connection]
+wifi.cloned-mac-address=random
+```
+
+When connectivity drops, StarBypass **cycles the connection down and back up**,
+which makes NetworkManager roll a fresh random MAC. The portal then sees a
+brand-new device and grants a new session, which the browser flow accepts. This
+is why it can re-authenticate indefinitely — each pass looks like a different
+device. Without `cloned-mac-address=random`, re-auth on the same (already
+capped) MAC would be rejected.
+
+#### Run it as a service
+
+A ready-made systemd user unit lives at
+[`packaging/starbypass.service`](packaging/starbypass.service):
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp packaging/starbypass.service ~/.config/systemd/user/
+# edit ExecStart if your binary path or SSID differ
+systemctl --user daemon-reload
+systemctl --user enable --now starbypass.service
+sudo loginctl enable-linger "$USER"   # so it runs without an active login
+```
 
 ## License
 
