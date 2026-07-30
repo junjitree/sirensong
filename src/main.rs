@@ -207,7 +207,7 @@ async fn confirmed_offline() -> bool {
 /// Tries an existing saved profile first (`connection down` then `up`), then
 /// falls back to associating with an open network (`dev wifi connect`).
 fn connect_to_wifi(cfg: &Config) -> bool {
-    info!(ssid = %cfg.ssid, "cycling connection for fresh MAC");
+    debug!(ssid = %cfg.ssid, "cycling connection for fresh MAC");
 
     // Down first so `up` is a full re-activation and NM re-applies a new
     // random MAC. Ignore failure here — the profile may already be down.
@@ -228,20 +228,20 @@ fn connect_to_wifi(cfg: &Config) -> bool {
             .map(|o| o.status.success())
             .unwrap_or(false);
         if !connect_ok {
-            error!(ssid = %cfg.ssid, "failed to connect to Wi-Fi");
+            debug!(ssid = %cfg.ssid, "failed to connect to Wi-Fi");
             return false;
         }
     }
 
     for tries in 1..20 {
         if active_ssid().as_deref() == Some(cfg.ssid.as_str()) {
-            info!(tries, "associated");
+            debug!(tries, "associated");
             return true;
         }
         std::thread::sleep(Duration::from_millis(500));
     }
 
-    error!(ssid = %cfg.ssid, "association never became active");
+    debug!(ssid = %cfg.ssid, "association never became active");
     false
 }
 
@@ -284,7 +284,7 @@ fn billing_pick_form(html: &str) -> Option<&str> {
 ///
 /// Returns whether the POST was accepted; the caller confirms real
 /// connectivity. Any parsing/network failure returns `false` (and logs a
-/// `warn!` if the markup looks like it changed) so we fall back to the browser.
+/// `warn!` if the markup looks like it changed, since that needs a code fix).
 async fn http_login(detect_url: &str) -> bool {
     let client = match reqwest::Client::builder()
         .cookie_store(true)
@@ -294,7 +294,7 @@ async fn http_login(detect_url: &str) -> bool {
     {
         Ok(c) => c,
         Err(e) => {
-            warn!(error = %e, "could not build HTTP client");
+            debug!(error = %e, "could not build HTTP client");
             return false;
         }
     };
@@ -303,7 +303,7 @@ async fn http_login(detect_url: &str) -> bool {
     let resp = match client.get(detect_url).send().await {
         Ok(r) => r,
         Err(e) => {
-            warn!(error = %e, "captive-detect request failed");
+            debug!(error = %e, "captive-detect request failed");
             return false;
         }
     };
@@ -315,22 +315,18 @@ async fn http_login(detect_url: &str) -> bool {
     let html = match resp.text().await {
         Ok(body) => html_unescape(&body),
         Err(e) => {
-            warn!(error = %e, "could not read splash page body");
+            debug!(error = %e, "could not read splash page body");
             return false;
         }
     };
 
     let Some(form) = billing_pick_form(&html) else {
-        warn!(
-            "no billing_pick form on splash; portal markup may have changed, falling back to browser"
-        );
+        warn!("no billing_pick form on splash; portal markup may have changed");
         return false;
     };
 
     let Some(token) = capture(form, r#"name="authenticity_token"\s+value="([^"]+)""#) else {
-        warn!(
-            "authenticity_token missing in free-plan form; portal markup may have changed, falling back to browser"
-        );
+        warn!("authenticity_token missing in free-plan form; portal markup may have changed");
         return false;
     };
     let continue_url =
@@ -356,7 +352,7 @@ async fn http_login(detect_url: &str) -> bool {
     match client.post(&post_url).form(&params).send().await {
         Ok(_) => true,
         Err(e) => {
-            warn!("Portal POST failed: {e}");
+            debug!(error = %e, "portal POST failed");
             false
         }
     }
@@ -378,7 +374,7 @@ async fn wait_online() -> bool {
 /// a new device — then authenticate over HTTP against the captive portal.
 async fn reconcile(cfg: &Config) -> bool {
     if is_online().await {
-        info!("already online");
+        debug!("already online");
         return true;
     }
 
@@ -386,27 +382,28 @@ async fn reconcile(cfg: &Config) -> bool {
     // SSID is actually in range. Off-site (e.g. home Wi-Fi) this makes us a
     // no-op instead of dropping the current connection to hunt for Starbucks.
     if !ssid_in_range(&cfg.ssid) {
-        info!(ssid = %cfg.ssid, "offline but target SSID not in range; leaving current network alone");
+        debug!(ssid = %cfg.ssid, "offline but target SSID not in range; leaving current network alone");
         return false;
     }
 
     if !connect_to_wifi(cfg) {
+        error!("couldn't join {}", cfg.ssid);
         return false;
     }
 
     // A fresh association occasionally restores connectivity on its own
     // (e.g. an open network with no portal); skip auth if so.
     if is_online().await {
-        info!("online after associating");
+        debug!("online after associating");
         return true;
     }
 
-    info!("authenticating over HTTP");
+    debug!("authenticating over HTTP");
     if http_login(CAPTIVE_DETECT_URL).await && wait_online().await {
-        info!(method = "http", "authenticated");
+        debug!(method = "http", "authenticated");
         true
     } else {
-        error!("HTTP authentication failed");
+        error!("could not sign in to the Wi-Fi portal");
         false
     }
 }
@@ -435,7 +432,11 @@ async fn sleep_or_shutdown(dur: Duration, sigterm: Option<&mut Signal>) -> bool 
 }
 
 async fn run_watch(cfg: &Config) {
-    info!(ssid = %cfg.ssid, interval_s = cfg.interval.as_secs(), "=== watching ===");
+    info!(
+        "watching {} every {}s — I'll keep you signed in and re-connect if it drops",
+        cfg.ssid,
+        cfg.interval.as_secs()
+    );
 
     let mut sigterm = match signal(SignalKind::terminate()) {
         Ok(s) => Some(s),
@@ -446,25 +447,38 @@ async fn run_watch(cfg: &Config) {
     };
 
     let mut consecutive_failures = 0u32;
+    // Only announce on state *changes*, so a healthy connection stays quiet
+    // instead of reprinting "you're good to browse" on every poll.
+    let mut online_announced = false;
     loop {
         // `||` short-circuits: reconcile only runs after we've confirmed we're
         // actually offline (several failed probes), not on a single blip.
-        let delay = if !confirmed_offline().await || reconcile(cfg).await {
+        let online = !confirmed_offline().await;
+        if !online && online_announced {
+            info!("connection dropped — signing back in");
+            online_announced = false;
+        }
+
+        let delay = if online || reconcile(cfg).await {
+            if !online_announced {
+                info!("you're good to browse — still watching");
+                online_announced = true;
+            }
             consecutive_failures = 0;
             cfg.interval
         } else {
             consecutive_failures += 1;
             let backoff = backoff_delay(cfg.interval, consecutive_failures);
+            debug!(failures = consecutive_failures, "reconcile failed");
             warn!(
-                failures = consecutive_failures,
-                backoff_s = backoff.as_secs(),
-                "reconcile failed; backing off"
+                "couldn't get you online — retrying in {}s",
+                backoff.as_secs()
             );
             backoff
         };
 
         if sleep_or_shutdown(delay, sigterm.as_mut()).await {
-            info!("shutdown signal received; exiting");
+            info!("stopping — no longer watching");
             break;
         }
     }
@@ -484,7 +498,11 @@ async fn main() {
     init_logging(cfg.quiet);
 
     if cfg.once {
-        std::process::exit(if reconcile(&cfg).await { 0 } else { 1 });
+        if reconcile(&cfg).await {
+            info!("you're good to browse");
+            std::process::exit(0);
+        }
+        std::process::exit(1);
     } else {
         run_watch(&cfg).await;
     }
