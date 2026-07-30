@@ -199,6 +199,84 @@ async fn confirmed_offline() -> bool {
     true
 }
 
+/// Name of the first Wi-Fi device in an `nmcli -t -f DEVICE,TYPE device status`
+/// dump. Matching the exact `:wifi` suffix skips `wifi-p2p` pseudo-devices.
+fn parse_wifi_device(status: &str) -> Option<String> {
+    status
+        .lines()
+        .find_map(|line| line.strip_suffix(":wifi").map(str::to_string))
+}
+
+fn wifi_device() -> Option<String> {
+    let out = Command::new("nmcli")
+        .args(["-t", "-f", "DEVICE,TYPE", "device", "status"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_wifi_device(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// nmcli's terse output escapes the colons inside a MAC (`AA\:BB\:…`), so strip
+/// the backslashes to get something printable and comparable.
+fn unescape_terse(s: &str) -> String {
+    s.trim().replace('\\', "")
+}
+
+/// The MAC currently *in use* on `dev` — `GENERAL.HWADDR` reflects the cloned
+/// address, not the burned-in one (that's `GENERAL.PERM-HWADDR`), which is
+/// exactly what we need to tell whether randomization actually took effect.
+fn device_mac(dev: &str) -> Option<String> {
+    let out = Command::new("nmcli")
+        .args(["-g", "GENERAL.HWADDR", "device", "show", dev])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let mac = unescape_terse(&String::from_utf8_lossy(&out.stdout));
+    if mac.is_empty() { None } else { Some(mac) }
+}
+
+/// Ask NetworkManager to assign this profile a fresh random MAC on every
+/// activation, so re-auth doesn't depend on the user having pre-configured a
+/// global `[connection] wifi.cloned-mac-address=random`.
+///
+/// `--temporary` keeps the change in memory only: nothing is written to the
+/// profile on disk and it is forgotten on NetworkManager restart, so we never
+/// mutate saved configuration.
+///
+/// Best-effort. Modifying a profile is a different polkit action
+/// (`settings.modify.system`) than activating one (`network-control`), so this
+/// can be denied — over SSH, for instance — even when `connection up` succeeds.
+/// It also fails when no saved profile exists yet. Either way a global setting
+/// may already cover us, so we log and carry on; `connect_to_wifi` verifies the
+/// real outcome by comparing MACs.
+fn ensure_random_mac(ssid: &str) -> bool {
+    let ok = Command::new("nmcli")
+        .args([
+            "connection",
+            "modify",
+            "--temporary",
+            ssid,
+            "wifi.cloned-mac-address",
+            "random",
+        ])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if ok {
+        debug!(ssid, "set wifi.cloned-mac-address=random (in-memory only)");
+    } else {
+        debug!(
+            ssid,
+            "could not set wifi.cloned-mac-address; relying on existing NM config"
+        );
+    }
+    ok
+}
+
 /// (Re)connect to the Wi-Fi, forcing a fresh activation so NetworkManager rolls
 /// a new randomized MAC (`wifi.cloned-mac-address=random`). The new MAC is what
 /// lets us re-authenticate past the captive portal's per-device usage cap — the
@@ -208,6 +286,13 @@ async fn confirmed_offline() -> bool {
 /// falls back to associating with an open network (`dev wifi connect`).
 fn connect_to_wifi(cfg: &Config) -> bool {
     debug!(ssid = %cfg.ssid, "cycling connection for fresh MAC");
+
+    let dev = wifi_device();
+    let mac_before = dev.as_deref().and_then(device_mac);
+
+    // Opt the profile into per-activation MAC randomization before cycling, so
+    // the `up` below is what picks up the new address.
+    ensure_random_mac(&cfg.ssid);
 
     // Down first so `up` is a full re-activation and NM re-applies a new
     // random MAC. Ignore failure here — the profile may already be down.
@@ -231,11 +316,18 @@ fn connect_to_wifi(cfg: &Config) -> bool {
             debug!(ssid = %cfg.ssid, "failed to connect to Wi-Fi");
             return false;
         }
+        // The profile only exists now that `dev wifi connect` created it, so the
+        // earlier attempt was a no-op; set it here to arm the *next* cycle. This
+        // pass keeps whatever MAC it associated with, which is fine — a device
+        // the portal has never seen doesn't need rotating yet.
+        ensure_random_mac(&cfg.ssid);
     }
 
     for tries in 1..20 {
         if active_ssid().as_deref() == Some(cfg.ssid.as_str()) {
             debug!(tries, "associated");
+            let mac_after = dev.as_deref().and_then(device_mac);
+            report_mac_rotation(mac_before.as_deref(), mac_after.as_deref());
             return true;
         }
         std::thread::sleep(Duration::from_millis(500));
@@ -243,6 +335,23 @@ fn connect_to_wifi(cfg: &Config) -> bool {
 
     debug!(ssid = %cfg.ssid, "association never became active");
     false
+}
+
+/// Tell the user when MAC rotation silently isn't happening. Without it the
+/// portal still sees the device whose allowance is already spent, so re-auth
+/// fails forever and the retry/backoff loop gives no clue why.
+///
+/// Only warns on a confirmed *unchanged* MAC; if either reading is missing we
+/// stay quiet rather than guess.
+fn report_mac_rotation(before: Option<&str>, after: Option<&str>) {
+    match (before, after) {
+        (Some(before), Some(after)) if before == after => warn!(
+            "MAC unchanged ({after}) — the portal still sees the same device, so re-auth will keep failing; \
+             set [connection] wifi.cloned-mac-address=random in /etc/NetworkManager/NetworkManager.conf"
+        ),
+        (Some(before), Some(after)) => debug!(%before, %after, "MAC rotated"),
+        _ => debug!("could not read MAC before/after; skipping rotation check"),
+    }
 }
 
 /// Minimal HTML entity decode — enough to recover attribute values (notably the
@@ -563,6 +672,25 @@ mod tests {
         assert!(ssid_in_scan(scan, "Starbucks Customer"));
         assert!(!ssid_in_scan(scan, "Starbucks"));
         assert!(!ssid_in_scan("", "Starbucks Customer"));
+    }
+
+    #[test]
+    fn wifi_device_skips_p2p_pseudo_devices() {
+        let status = "lo:loopback\np2p-dev-wlp3s0:wifi-p2p\nwlp3s0:wifi\nenp0s31f6:ethernet\n";
+        assert_eq!(parse_wifi_device(status), Some("wlp3s0".to_string()));
+    }
+
+    #[test]
+    fn wifi_device_none_without_wifi() {
+        assert_eq!(parse_wifi_device("lo:loopback\nenp0s31f6:ethernet\n"), None);
+    }
+
+    #[test]
+    fn terse_mac_loses_escaping() {
+        assert_eq!(
+            unescape_terse("AA\\:BB\\:CC\\:DD\\:EE\\:FF\n"),
+            "AA:BB:CC:DD:EE:FF"
+        );
     }
 
     #[test]

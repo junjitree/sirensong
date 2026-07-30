@@ -8,7 +8,10 @@ runs out.
 ## Prerequisites
 
 - `nmcli` (NetworkManager command-line tool)
-- Rust and Cargo
+- Rust and Cargo (only to build from source)
+
+MAC randomization is configured automatically — see
+[How re-auth works](#how-re-auth-works-mac-rotation) if it can't be applied.
 
 ## Installation
 
@@ -103,8 +106,27 @@ join next alone instead of hunting for the Starbucks AP.
 
 ### How re-auth works (MAC rotation)
 
-Captive portals cap usage **per device (MAC address)**. SirenSong relies on
-NetworkManager being configured to randomize the MAC on each connection —
+Captive portals cap usage **per device (MAC address)**. When connectivity drops,
+SirenSong **cycles the connection down and back up**, which makes NetworkManager
+roll a fresh random MAC. The portal then sees a brand-new device and grants a
+new session, which the HTTP login claims. This is why it can re-authenticate
+indefinitely — each pass looks like a different device.
+
+Rotation needs `wifi.cloned-mac-address=random` to be in effect. SirenSong sets
+that itself before each reconnect:
+
+```bash
+nmcli connection modify --temporary "<SSID>" wifi.cloned-mac-address random
+```
+
+`--temporary` means **in-memory only** — nothing is written to your saved
+profile and the change is forgotten when NetworkManager restarts, so your
+configuration is left alone.
+
+That call can be denied, though: modifying a profile is a different polkit
+action than activating one, so it may fail where `nmcli connection up` succeeds
+(over SSH, for instance). SirenSong logs it and carries on rather than aborting.
+If you hit that, set the global default yourself:
 
 ```ini
 # /etc/NetworkManager/NetworkManager.conf
@@ -112,12 +134,20 @@ NetworkManager being configured to randomize the MAC on each connection —
 wifi.cloned-mac-address=random
 ```
 
-When connectivity drops, SirenSong **cycles the connection down and back up**,
-which makes NetworkManager roll a fresh random MAC. The portal then sees a
-brand-new device and grants a new session, which the HTTP login claims. This is
-why it can re-authenticate indefinitely — each pass looks like a different
-device. Without `cloned-mac-address=random`, re-auth on the same (already
-capped) MAC would be rejected.
+Either way SirenSong **verifies the outcome** rather than assuming it, comparing
+the in-use MAC before and after the cycle. If it did not change, you get a
+warning naming the fix — instead of a silent retry loop, which is what an
+already-capped MAC otherwise looks like:
+
+```
+WARN MAC unchanged (AA:BB:CC:DD:EE:FF) — the portal still sees the same device, so
+     re-auth will keep failing; set [connection] wifi.cloned-mac-address=random in
+     /etc/NetworkManager/NetworkManager.conf
+```
+
+Note that a MAC pinned on the profile itself
+(`802-11-wireless.cloned-mac-address` set to a fixed address or `permanent`)
+overrides the global default — the before/after check catches that case too.
 
 ## Disclaimer
 
