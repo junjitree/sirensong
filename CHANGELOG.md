@@ -8,6 +8,24 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **Fail the build on non-Linux targets**: sirensong compiled and installed
+  cleanly on macOS and then did nothing useful — every `nmcli` call failed and
+  each call site ends in `.unwrap_or(false)`, so it failed silently. A
+  `compile_error!` now rejects non-Linux targets with a message naming the
+  reason.
+
+### Documented
+
+- **Platform support is Linux-only, and why**: re-auth depends on rotating the
+  Wi-Fi MAC, and the macOS Wi-Fi driver permits exactly one address — its own.
+  Verified on macOS 26.5.2 (Apple M3 Pro) against the `SIOCSIFLLADDR` ioctl:
+  any other address fails with `EADDRNOTAVAIL` whether associated or with the
+  radio off, while writing the interface's current address back succeeds. A
+  non-Wi-Fi interface on the same machine rotates fine with SIP enabled, so
+  this is a driver restriction rather than an OS-wide one.
+
 ## [0.1.2] - 2026-07-30
 
 ### Fixed
