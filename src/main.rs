@@ -435,7 +435,7 @@ async fn sleep_or_shutdown(dur: Duration, sigterm: Option<&mut Signal>) -> bool 
 }
 
 async fn run_watch(cfg: &Config) {
-    info!(ssid = %cfg.ssid, interval_s = cfg.interval.as_secs(), "watching");
+    info!(ssid = %cfg.ssid, interval_s = cfg.interval.as_secs(), "=== watching ===");
 
     let mut sigterm = match signal(SignalKind::terminate()) {
         Ok(s) => Some(s),
