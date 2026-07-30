@@ -12,6 +12,14 @@ runs out.
 
 ## Installation
 
+From [crates.io](https://crates.io/crates/sirensong):
+
+```bash
+cargo install sirensong
+```
+
+### From source
+
 1. Clone this repository:
 
    ```bash
@@ -21,11 +29,11 @@ runs out.
 
 2. Build with Cargo:
 
-```bash
-cargo build --release
-```
+   ```bash
+   cargo build --release
+   ```
 
-Alternatively, you can install it directly to your system's Cargo bin directory:
+Or install straight into your Cargo bin directory:
 
 ```bash
 cargo install --path .
@@ -63,9 +71,14 @@ sirensong [OPTIONS] [SSID]
 
   -o, --once             Authenticate once and exit (default: watch and re-auth on drop)
   -i, --interval <SECS>  Watch poll interval in seconds (default: 60)
-  -q, --quiet            Suppress status output (errors still print)
+  -q, --quiet            Only log errors (overrides RUST_LOG)
   -h, --help             Print help
+  -V, --version          Print version
 ```
+
+By default it logs plain status lines — when you are watching, when you are good
+to browse, and when the connection drops. For the underlying mechanics (MAC
+cycling, association attempts, portal form submission), set `RUST_LOG=debug`.
 
 Before doing anything, sirensong runs a lightweight `generate_204` connectivity
 check and exits early if you are already online, so repeated runs are cheap.
