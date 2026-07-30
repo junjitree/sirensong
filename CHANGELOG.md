@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-07-30
+
 ### Fixed
 
 - **Never cycle a network that is merely offline**: the reconnect guard was
@@ -101,6 +103,7 @@ Initial release.
 - The Python implementation and the bundled systemd unit (watch mode covers the
   latter).
 
-[unreleased]: https://github.com/junjitree/sirensong/compare/v0.1.1...main
+[unreleased]: https://github.com/junjitree/sirensong/compare/v0.1.2...main
+[0.1.2]: https://github.com/junjitree/sirensong/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/junjitree/sirensong/compare/d70766b...v0.1.1
 [0.1.0]: https://github.com/junjitree/sirensong/commits/d70766b
