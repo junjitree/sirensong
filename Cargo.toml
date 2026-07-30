@@ -1,6 +1,6 @@
 [package]
 name = "sirensong"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Automates Starbucks Wi-Fi captive-portal login with MAC rotation"
 license = "MIT"
