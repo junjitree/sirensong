@@ -7,11 +7,47 @@ runs out.
 
 ## Prerequisites
 
+- **Linux** — see [Platform support](#platform-support)
 - `nmcli` (NetworkManager command-line tool)
 - Rust and Cargo (only to build from source)
 
 MAC randomization is configured automatically — see
 [How re-auth works](#how-re-auth-works-mac-rotation) if it can't be applied.
+
+## Platform support
+
+SirenSong is **Linux-only**, and not merely for want of a second backend.
+Building on any other OS fails with a message saying so, rather than installing
+a binary that runs and silently does nothing.
+
+The portal login itself is plain HTTP and would port anywhere. What does not
+port is the part that makes re-auth work at all: rolling a fresh MAC on each
+reconnect. On Linux that is declarative — NetworkManager's
+`wifi.cloned-mac-address=random` assigns a new address on every activation.
+
+**The macOS Wi-Fi driver permits exactly one MAC address: its own.** Verified on
+an Apple M3 Pro running macOS 26.5.2, driving the `SIOCSIFLLADDR` ioctl
+directly. Setting any other address on `en0` fails with `EADDRNOTAVAIL` whether
+the interface is associated or the radio is powered off, for both a
+locally-administered address and one reusing the adapter's own OUI — while
+writing `en0`'s *current* address back to it succeeds. So the driver reaches the
+point of validating the address and refuses every value but one.
+
+This is not a system-wide prohibition. A non-Wi-Fi interface on the same machine
+changes its MAC through the same ioctl without complaint, with SIP enabled, so
+neither SIP nor privilege is what stands in the way. Nor does disassociating
+help: a down interface rejects the write with `ENETDOWN` on *any* hardware,
+which is why the old `airport -z` recipe cannot be revived.
+
+Apple's own Private Wi-Fi Address is no substitute either: "Rotating" changes
+about every two weeks, and the address is cached for 24 hours after forgetting a
+network, so forget-and-rejoin reuses it. Purging that cache means writing to a
+TCC-protected system plist, which needs Full Disk Access granted to the calling
+application — not something a `cargo install`ed binary has, and not something
+worth asking for. SirenSong needs rotation on the order of an hour.
+
+Without rotation a macOS port would reduce to "logs you in once", which the
+system captive-portal sheet already does.
 
 ## Installation
 

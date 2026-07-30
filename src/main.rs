@@ -1,3 +1,19 @@
+// SirenSong is Linux-only. Every network operation goes through NetworkManager's
+// `nmcli`, and each call site ends in `.unwrap_or(false)` — so on another OS the
+// binary builds, runs, and silently does nothing. Fail the build instead.
+//
+// This is not just a missing backend. Re-auth works by rolling a fresh MAC on
+// each reconnect, and macOS refuses to change the Wi-Fi MAC at all: `ifconfig
+// <dev> ether` is rejected by the driver whether the interface is up, brought
+// down, or the radio is powered off. Without rotation a port would reduce to
+// "logs you in once", which the OS captive-portal sheet already does.
+#[cfg(not(target_os = "linux"))]
+compile_error!(
+    "sirensong supports Linux only: it drives NetworkManager via nmcli, and its \
+     re-auth depends on rotating the Wi-Fi MAC, which macOS does not permit. \
+     See https://github.com/junjitree/sirensong/issues/5"
+);
+
 use std::env;
 use std::process::Command;
 use std::time::Duration;
