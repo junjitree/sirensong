@@ -18,6 +18,10 @@ const CAPTIVE_DETECT_URL: &str = "http://connectivitycheck.gstatic.com/generate_
 const BROWSER_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 /// Upper bound on watch-mode backoff between failed reconcile attempts.
 const MAX_BACKOFF: Duration = Duration::from_secs(900);
+/// Registrable domain of the Cisco Meraki splash portals we can log into (hosts
+/// look like `n143.network-auth.com`). This is how we recognize *our* portal
+/// without ever asking which network we are on.
+const PORTAL_HOST: &str = "network-auth.com";
 
 struct Config {
     ssid: String,
@@ -102,23 +106,51 @@ fn init_logging(quiet: bool) {
         .init();
 }
 
+/// What a connectivity probe actually found.
+///
+/// `Intercepted` and `Down` both mean "no internet", but they are very
+/// different situations: a captive portal *answers* (with a splash page or a
+/// redirect to one), whereas a dead uplink answers nothing at all. Telling them
+/// apart is what lets us re-authenticate our own portal while leaving someone
+/// else's merely-broken network alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// `204` — real internet.
+    Online,
+    /// Some other HTTP reply: something answered on our behalf, i.e. a portal.
+    Intercepted,
+    /// No usable reply at all — no DNS, no TCP, or nothing that looks like HTTP.
+    Down,
+}
+
+/// Classify the first bytes of a reply to the `generate_204` probe.
+fn classify_response(head: &str) -> Reach {
+    if head.starts_with("HTTP/1.0 204") || head.starts_with("HTTP/1.1 204") {
+        Reach::Online
+    } else if head.starts_with("HTTP/") {
+        Reach::Intercepted
+    } else {
+        Reach::Down
+    }
+}
+
 /// Lightweight captive-portal check: a raw HTTP GET to a well-known
 /// `generate_204` endpoint. Real internet returns `204`; a captive portal
-/// intercepts with a `200`/redirect.
-fn is_online_blocking() -> bool {
+/// intercepts with a `200`/redirect; a dead uplink never replies.
+fn probe_blocking() -> Reach {
     use std::io::{Read, Write};
     use std::net::{TcpStream, ToSocketAddrs};
 
     let addr = match (CONNECTIVITY_HOST, 80).to_socket_addrs() {
         Ok(mut it) => match it.next() {
             Some(a) => a,
-            None => return false,
+            None => return Reach::Down,
         },
-        Err(_) => return false,
+        Err(_) => return Reach::Down,
     };
     let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
         Ok(s) => s,
-        Err(_) => return false,
+        Err(_) => return Reach::Down,
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
@@ -127,23 +159,24 @@ fn is_online_blocking() -> bool {
         "GET /generate_204 HTTP/1.0\r\nHost: {CONNECTIVITY_HOST}\r\nConnection: close\r\n\r\n"
     );
     if stream.write_all(req.as_bytes()).is_err() {
-        return false;
+        return Reach::Down;
     }
 
     let mut buf = [0u8; 64];
     match stream.read(&mut buf) {
-        Ok(n) => {
-            let head = String::from_utf8_lossy(&buf[..n]);
-            head.starts_with("HTTP/1.0 204") || head.starts_with("HTTP/1.1 204")
-        }
-        Err(_) => false,
+        Ok(0) | Err(_) => Reach::Down,
+        Ok(n) => classify_response(&String::from_utf8_lossy(&buf[..n])),
     }
 }
 
-async fn is_online() -> bool {
-    tokio::task::spawn_blocking(is_online_blocking)
+async fn probe() -> Reach {
+    tokio::task::spawn_blocking(probe_blocking)
         .await
-        .unwrap_or(false)
+        .unwrap_or(Reach::Down)
+}
+
+async fn is_online() -> bool {
+    probe().await == Reach::Online
 }
 
 /// Parse the currently-active SSID from `nmcli -t -f active,ssid dev wifi`.
@@ -354,6 +387,36 @@ fn report_mac_rotation(before: Option<&str>, after: Option<&str>) {
     }
 }
 
+/// Whether a splash page's host belongs to the Meraki portal family we know how
+/// to log into. Matching the registrable domain rather than an exact host keeps
+/// working as Meraki shuffles its numbered front-ends (`n143`, `n747`, …), while
+/// the leading dot stops `network-auth.com.example.org` from matching.
+fn is_known_portal(host: &str) -> bool {
+    host == PORTAL_HOST || host.ends_with(&format!(".{PORTAL_HOST}"))
+}
+
+/// Follow the captive-detect URL to whatever splash page intercepted it and
+/// report the host that served it.
+///
+/// This is the identity check that replaces "which SSID am I on": a portal that
+/// answers from `*.network-auth.com` is demonstrably ours, no matter what the
+/// network is called — and on a network whose uplink is merely dead, nothing
+/// answers at all. Returns `None` if we ended up online after all, or if the
+/// request failed.
+async fn portal_host(detect_url: &str) -> Option<String> {
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .user_agent(BROWSER_UA)
+        .timeout(Duration::from_secs(15))
+        .build()
+        .ok()?;
+    let resp = client.get(detect_url).send().await.ok()?;
+    if resp.status().as_u16() == 204 {
+        return None;
+    }
+    resp.url().host_str().map(str::to_string)
+}
+
 /// Minimal HTML entity decode — enough to recover attribute values (notably the
 /// form `action` URL) from the Meraki splash page, whose markup is served
 /// HTML-escaped. `&amp;` is decoded last so we don't re-expand other entities.
@@ -484,21 +547,56 @@ async fn wait_online() -> bool {
     false
 }
 
-/// One reconciliation pass: if already online, do nothing. Otherwise reconnect
-/// — which rolls a fresh MAC (see `connect_to_wifi`) so the portal treats us as
-/// a new device — then authenticate over HTTP against the captive portal.
+/// One reconciliation pass: if already online, do nothing. Otherwise decide
+/// whether this network is ours to act on, and only then reconnect — which
+/// rolls a fresh MAC (see `connect_to_wifi`) so the portal treats us as a new
+/// device — and authenticate over HTTP against the captive portal.
+///
+/// The decision is made by asking *who answered*, never by asking which network
+/// we are on. A portal that identifies itself is ours to log into; silence means
+/// the uplink is simply dead and we should keep our hands off.
 async fn reconcile(cfg: &Config) -> bool {
-    if is_online().await {
-        debug!("already online");
-        return true;
-    }
-
-    // Don't hijack whatever network we're on: only reconnect if the target
-    // SSID is actually in range. Off-site (e.g. home Wi-Fi) this makes us a
-    // no-op instead of dropping the current connection to hunt for Starbucks.
-    if !ssid_in_range(&cfg.ssid) {
-        debug!(ssid = %cfg.ssid, "offline but target SSID not in range; leaving current network alone");
-        return false;
+    match probe().await {
+        Reach::Online => {
+            debug!("already online");
+            return true;
+        }
+        Reach::Intercepted => {
+            // Something answered on our behalf. Touch the connection only if it
+            // is a portal we can actually log into — otherwise we are a guest on
+            // somebody else's network and have no business cycling it.
+            match portal_host(CAPTIVE_DETECT_URL).await {
+                Some(host) if is_known_portal(&host) => {
+                    debug!(host, "captive portal recognized");
+                }
+                Some(host) => {
+                    debug!(
+                        host,
+                        "unrecognized captive portal; leaving this network alone"
+                    );
+                    return false;
+                }
+                None => {
+                    debug!("captive portal did not identify itself; leaving this network alone");
+                    return false;
+                }
+            }
+        }
+        Reach::Down => {
+            // Nothing answered at all. If we are associated to something, its
+            // uplink is dead rather than gated — the case where a home outage
+            // used to send us hunting for the café AP. Leave it alone.
+            if active_ssid().is_some() {
+                debug!("offline with no portal answering; leaving current network alone");
+                return false;
+            }
+            // Associated to nothing, so there is no connection to disrupt. Still
+            // skip the join if the target is not even in range.
+            if !ssid_in_range(&cfg.ssid) {
+                debug!(ssid = %cfg.ssid, "not associated and target SSID not in range");
+                return false;
+            }
+        }
     }
 
     if !connect_to_wifi(cfg) {
@@ -798,5 +896,101 @@ mod tests {
         assert!(ok, "http_login should complete the mock portal flow");
         // MockServer's Drop verifies the POST expectation (exactly 1 hit with
         // the right token + plan), so a wrong token would fail the test.
+    }
+
+    #[test]
+    fn classifies_204_as_online() {
+        assert_eq!(
+            classify_response("HTTP/1.1 204 No Content\r\n"),
+            Reach::Online
+        );
+        assert_eq!(
+            classify_response("HTTP/1.0 204 No Content\r\n"),
+            Reach::Online
+        );
+    }
+
+    // The distinction the whole guard rests on: a portal answers, a dead uplink
+    // does not. Both mean "no internet", but only one is ours to act on.
+    #[test]
+    fn classifies_other_http_replies_as_intercepted() {
+        assert_eq!(classify_response("HTTP/1.1 200 OK\r\n"), Reach::Intercepted);
+        assert_eq!(
+            classify_response("HTTP/1.1 302 Found\r\n"),
+            Reach::Intercepted
+        );
+        assert_eq!(
+            classify_response("HTTP/1.0 511 Network Authentication Required\r\n"),
+            Reach::Intercepted
+        );
+    }
+
+    #[test]
+    fn classifies_non_http_as_down() {
+        assert_eq!(classify_response(""), Reach::Down);
+        assert_eq!(classify_response("\0\0garbage"), Reach::Down);
+    }
+
+    #[test]
+    fn known_portal_matches_meraki_front_ends() {
+        assert!(is_known_portal("n143.network-auth.com"));
+        assert!(is_known_portal("n747.network-auth.com"));
+        assert!(is_known_portal("network-auth.com"));
+    }
+
+    // A lookalike host must not be mistaken for ours, or we would cycle a
+    // stranger's network on their say-so.
+    #[test]
+    fn known_portal_rejects_lookalikes() {
+        assert!(!is_known_portal("network-auth.com.example.org"));
+        assert!(!is_known_portal("evil-network-auth.com"));
+        assert!(!is_known_portal("example.org"));
+        assert!(!is_known_portal(""));
+    }
+
+    #[tokio::test]
+    async fn portal_host_reports_who_intercepted_us() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let base = server.uri();
+
+        Mock::given(method("GET"))
+            .and(path("/generate_204"))
+            .respond_with(
+                ResponseTemplate::new(307).insert_header("location", format!("{base}/splash")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/splash"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html/>"))
+            .mount(&server)
+            .await;
+
+        // The host we report is the one that served the splash after redirects,
+        // which is what identifies the portal.
+        let host = portal_host(&format!("{base}/generate_204")).await;
+        assert_eq!(host.as_deref(), Some("127.0.0.1"));
+        assert!(!is_known_portal(&host.unwrap()));
+    }
+
+    // A real 204 means nobody intercepted us, so there is no portal to name.
+    #[tokio::test]
+    async fn portal_host_is_none_when_actually_online() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let base = server.uri();
+
+        Mock::given(method("GET"))
+            .and(path("/generate_204"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        assert_eq!(portal_host(&format!("{base}/generate_204")).await, None);
     }
 }

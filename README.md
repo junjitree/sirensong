@@ -109,9 +109,16 @@ sirensong logs that it found no free-plan form and keeps retrying without
 adapting.
 
 It only reconnects when it confirms it is offline (several failed probes, so a
-momentary blip does not trigger a needless reconnect) **and** the target SSID is
-in range. If you walk away and forget to stop it, it leaves whatever network you
-join next alone instead of hunting for the Starbucks AP.
+momentary blip does not trigger a needless reconnect) **and** it can see that
+the network it is attached to is a captive portal it knows how to log into.
+
+That second check is what makes it safe to forget about. Rather than asking
+"which network am I on", sirensong asks **who answered**: a captive portal
+replies to its connectivity probe (with a splash page or a redirect to one),
+while a network whose uplink is simply down replies with nothing at all. So if
+you walk away and forget to stop it, and your home internet later drops, it sees
+silence rather than a portal and leaves your connection alone. An unfamiliar
+portal — a hotel or airport — is left alone too.
 
 ### How re-auth works (MAC rotation)
 

@@ -8,6 +8,30 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **Never cycle a network that is merely offline**: the reconnect guard was
+  `ssid_in_range`, which only proves a matching AP is within radio range — not
+  that we are on it. In a city with a Starbucks nearby, a home internet outage
+  satisfied that check, so sirensong dropped the working home connection and
+  jumped to the café AP. It now identifies the network by **who answered** its
+  connectivity probe instead of by name.
+
+### Added
+
+- **Portal-identity guard**: `Reach` splits the connectivity probe's three
+  outcomes apart instead of collapsing them into a bool — `Online` (`204`),
+  `Intercepted` (any other HTTP reply, meaning something answered on our
+  behalf), and `Down` (no DNS, no TCP, or nothing resembling HTTP). A captive
+  portal answers; a dead uplink does not. `reconcile` now acts only when a
+  portal answers _and_ `portal_host` reports a host under `network-auth.com`; an
+  unrecognized portal, or silence while associated, leaves the connection
+  untouched. `ssid_in_range` survives only as a cheap skip when nothing is
+  associated at all.
+- Tests for `classify_response`, `is_known_portal` (including lookalike hosts
+  such as `network-auth.com.example.org`), and `portal_host` against a mock
+  splash — the guard is unit-testable, unlike the `nmcli` layer it replaces.
+
 ## [0.1.1] - 2026-07-30
 
 ### Added
