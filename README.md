@@ -95,9 +95,18 @@ it drops. Just run it in a terminal while you are at the café and stop it
 
 ```bash
 sirensong                       # watch "Starbucks Customer"
-sirensong "Some Other Cafe"     # watch a different SSID
+sirensong "Some Other Cafe"     # watch a different SSID (see below)
 sirensong -i 30                 # poll every 30s
 ```
+
+**On other SSIDs:** the SSID argument only changes which network it joins — the
+portal login itself is hardcoded to the Cisco Meraki **free-plan** splash. So a
+different SSID works if the network is open with no portal at all (it
+associates, sees connectivity, and does nothing further), or if it runs that
+same Meraki free-plan splash. Any other portal — a different vendor, or Meraki
+configured for vouchers, click-through terms, or SMS — is not supported;
+sirensong logs that it found no free-plan form and keeps retrying without
+adapting.
 
 It only reconnects when it confirms it is offline (several failed probes, so a
 momentary blip does not trigger a needless reconnect) **and** the target SSID is

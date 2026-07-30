@@ -430,12 +430,18 @@ async fn http_login(detect_url: &str) -> bool {
     };
 
     let Some(form) = billing_pick_form(&html) else {
-        warn!("no billing_pick form on splash; portal markup may have changed");
+        warn!(
+            "no Meraki free-plan form on this splash page — sirensong only handles the Meraki \
+             free-plan portal, so this may be a different vendor (or Meraki markup that changed)"
+        );
         return false;
     };
 
     let Some(token) = capture(form, r#"name="authenticity_token"\s+value="([^"]+)""#) else {
-        warn!("authenticity_token missing in free-plan form; portal markup may have changed");
+        warn!(
+            "authenticity_token missing from the free-plan form — the Meraki splash markup \
+             has likely changed"
+        );
         return false;
     };
     let continue_url =
