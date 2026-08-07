@@ -1049,26 +1049,109 @@ fn ap_is_up() -> bool {
         .unwrap_or(false)
 }
 
+/// Country code from an `iw reg get` dump. `00` is the world domain, under which
+/// most channels are `no IR` — transmission forbidden.
+fn parse_regdom_country(iw_reg: &str) -> Option<String> {
+    iw_reg
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("country "))
+        .and_then(|rest| rest.split(':').next())
+        .map(|c| c.trim().to_string())
+}
+
+/// Warn before we even try if the regulatory domain forbids beaconing. Without
+/// this the failure surfaces 25 seconds later as hostapd's opaque "could not
+/// determine operating frequency", which is a genuinely hard thing to diagnose.
+fn warn_if_regdom_blocks_ap() {
+    let Ok(out) = Command::new("iw").args(["reg", "get"]).output() else {
+        return;
+    };
+    let country = parse_regdom_country(&String::from_utf8_lossy(&out.stdout));
+    if country.as_deref() == Some("00") {
+        warn!(
+            "regulatory domain is `country 00` (world), which forbids transmitting on \
+             most channels — the hotspot will probably fail to start. Set your country, \
+             e.g. `sudo iw reg set PH`, and persist it in /etc/modprobe.d/cfg80211.conf \
+             as `options cfg80211 ieee80211_regdom=PH`"
+        );
+    }
+}
+
 /// Stops the hotspot when dropped, so it doesn't outlive sirensong and sit
 /// there draining battery. Covers clean exit, Ctrl-C and panics; nothing can
 /// cover SIGKILL.
+///
+/// Also carries what's needed to bring the AP back if it dies mid-session —
+/// otherwise sirensong would keep cheerfully watching the portal while the
+/// phone behind it has no network and nothing says so.
 struct HotspotGuard {
-    iface: String,
+    /// The radio, as `create_ap --stop` wants it (e.g. `wlp2s0`).
+    wifi_iface: String,
+    /// The virtual AP interface it created (e.g. `ap0`), for health checks.
+    ap_iface: String,
+    ssid: String,
+    pass: String,
+    channel: u32,
+}
+
+impl HotspotGuard {
+    /// Cheap liveness check — a single sysfs read, no process spawn and no
+    /// output parsing, so it's fine to run on every watch tick.
+    fn is_up(&self) -> bool {
+        std::fs::read_to_string(format!("/sys/class/net/{}/operstate", self.ap_iface))
+            .map(|s| {
+                let s = s.trim();
+                s == "up" || s == "unknown"
+            })
+            .unwrap_or(false)
+    }
+
+    /// Tear down whatever is left and start the AP again.
+    fn restart(&self) -> bool {
+        let _ = Command::new("sudo")
+            .args(["create_ap", "--stop", &self.wifi_iface])
+            .output();
+        std::thread::sleep(ROTATE_POLL);
+        let launched = Command::new("sudo")
+            .args([
+                "create_ap",
+                "--daemon",
+                "-c",
+                &self.channel.to_string(),
+                &self.wifi_iface,
+                &self.wifi_iface,
+                &self.ssid,
+                &self.pass,
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !launched {
+            return false;
+        }
+        for _ in 0..AP_START_POLLS {
+            std::thread::sleep(AP_START_POLL);
+            if self.is_up() {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 impl Drop for HotspotGuard {
     fn drop(&mut self) {
         info!("stopping hotspot");
         let stopped = Command::new("sudo")
-            .args(["create_ap", "--stop", &self.iface])
+            .args(["create_ap", "--stop", &self.wifi_iface])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
         if !stopped {
             warn!(
-                iface = %self.iface,
+                iface = %self.wifi_iface,
                 "could not stop the hotspot; check with: sudo create_ap --stop {}",
-                self.iface
+                self.wifi_iface
             );
         }
     }
@@ -1102,7 +1185,15 @@ fn generate_passphrase() -> Option<String> {
 /// Resolve the passphrase: an explicit one wins, else reuse what we generated
 /// last time, else generate one and remember it (owner-readable only).
 fn resolve_passphrase(explicit: Option<&String>) -> Option<String> {
+    // Say which source won. Without this, a stale SIRENSONG_HOTSPOT_PASS in the
+    // shell silently overrides the saved passphrase and looks like a bug.
     if let Some(p) = explicit {
+        let from = if env::var("SIRENSONG_HOTSPOT_PASS").as_ref() == Ok(p) {
+            "SIRENSONG_HOTSPOT_PASS"
+        } else {
+            "--hotspot-pass"
+        };
+        info!("using the passphrase from {from}");
         return Some(p.clone());
     }
     let path = hotspot_pass_path()?;
@@ -1110,7 +1201,7 @@ fn resolve_passphrase(explicit: Option<&String>) -> Option<String> {
     if let Ok(stored) = std::fs::read_to_string(&path) {
         let stored = stored.trim().to_string();
         if stored.len() >= 8 {
-            debug!(path = %path.display(), "reusing remembered hotspot passphrase");
+            info!(path = %path.display(), "using the remembered passphrase");
             return Some(stored);
         }
     }
@@ -1174,6 +1265,7 @@ fn print_join_details(ssid: &str, pass: &str) {
 fn hotspot_start(hs: &Hotspot) -> Option<HotspotGuard> {
     let iface = wifi_device()?;
     let pass = resolve_passphrase(hs.pass.as_ref())?;
+    warn_if_regdom_blocks_ap();
     info!(
         ssid = %hs.ssid,
         channel = hs.channel,
@@ -1197,16 +1289,25 @@ fn hotspot_start(hs: &Hotspot) -> Option<HotspotGuard> {
         return None;
     }
 
+    // Stop-on-drop from here on, so a half-started AP is cleaned up even if the
+    // wait below gives up. The AP interface name is discovered rather than
+    // assumed, then remembered so health checks are a plain sysfs read.
+    let mut guard = HotspotGuard {
+        wifi_iface: iface.clone(),
+        ap_iface: String::new(),
+        ssid: hs.ssid.clone(),
+        pass: pass.clone(),
+        channel: hs.channel,
+    };
+
     // Wait for it to actually beacon rather than assuming a duration — the
     // interface can appear seconds before hostapd finishes, or never come up at
     // all if the regulatory domain blocks the channel.
-    let guard = HotspotGuard {
-        iface: iface.clone(),
-    };
     for _ in 0..AP_START_POLLS {
         std::thread::sleep(AP_START_POLL);
         if ap_is_up() {
-            info!(ssid = %hs.ssid, "hotspot is up");
+            guard.ap_iface = ap_interface().unwrap_or_else(|| "ap0".to_string());
+            info!(ssid = %hs.ssid, iface = %guard.ap_iface, "hotspot is up");
             print_join_details(&hs.ssid, &pass);
             return Some(guard);
         }
@@ -1243,7 +1344,7 @@ async fn sleep_or_shutdown(dur: Duration, sigterm: Option<&mut Signal>) -> bool 
     }
 }
 
-async fn run_watch(cfg: &Config) {
+async fn run_watch(cfg: &Config, hotspot: Option<&HotspotGuard>) {
     info!(
         "watching {} every {}s — I'll keep you signed in and re-connect if it drops",
         cfg.ssid,
@@ -1263,6 +1364,17 @@ async fn run_watch(cfg: &Config) {
     // instead of reprinting "you're good to browse" on every poll.
     let mut online_announced = false;
     loop {
+        // A hotspot that quietly died leaves devices behind it with no network
+        // and nothing to tell them why, so check it every tick and bring it back.
+        if let Some(ap) = hotspot.filter(|ap| !ap.is_up()) {
+            warn!(iface = %ap.ap_iface, "hotspot went down — restarting it");
+            if ap.restart() {
+                info!(ssid = %ap.ssid, "hotspot is back up");
+            } else {
+                error!("could not bring the hotspot back; devices behind it have no network");
+            }
+        }
+
         // `||` short-circuits: reconcile only runs after we've confirmed we're
         // actually offline (several failed probes), not on a single blip.
         let online = !confirmed_offline().await;
@@ -1337,7 +1449,7 @@ async fn main() {
         },
     };
 
-    run_watch(&cfg).await;
+    run_watch(&cfg, _hotspot.as_ref()).await;
 }
 
 #[cfg(test)]
@@ -1539,6 +1651,19 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cfg.hotspot.expect("configured").ssid, "myap");
+    }
+
+    // `country 00` is the world domain: transmitting is forbidden on most
+    // channels, which is what makes create_ap fail with an opaque hostapd error.
+    #[test]
+    fn reads_country_from_iw_reg() {
+        let world = "global\ncountry 00: DFS-UNSET\n\t(2402 - 2472 @ 40), (N/A, 20), (N/A)\n";
+        assert_eq!(parse_regdom_country(world).as_deref(), Some("00"));
+
+        let ph = "global\ncountry PH: DFS-FCC\n\t(2400 - 2483 @ 40), (N/A, 20), (N/A)\n";
+        assert_eq!(parse_regdom_country(ph).as_deref(), Some("PH"));
+
+        assert_eq!(parse_regdom_country("no country line here"), None);
     }
 
     #[test]
