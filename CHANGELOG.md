@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-08-07
+
 ### Added
 
 - **Share the connection over a Wi-Fi hotspot** (`--hotspot`): brings up an AP
@@ -137,7 +139,8 @@ Initial release.
 - The Python implementation and the bundled systemd unit (watch mode covers the
   latter).
 
-[unreleased]: https://github.com/junjitree/sirensong/compare/v0.1.2...main
+[unreleased]: https://github.com/junjitree/sirensong/compare/v0.1.3...main
+[0.1.3]: https://github.com/junjitree/sirensong/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/junjitree/sirensong/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/junjitree/sirensong/compare/d70766b...v0.1.1
 [0.1.0]: https://github.com/junjitree/sirensong/commits/d70766b
