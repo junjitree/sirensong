@@ -32,12 +32,30 @@ const ROTATE_STALL_POLLS: u32 = 30;
 /// Absolute backstop so a wedged daemon can't block the watch loop forever.
 /// Should never be reached; the stall detector is the real mechanism.
 const ROTATE_MAX_POLLS: u32 = 300;
+/// How long to wait for the hotspot to actually start beaconing.
+const AP_START_POLL: Duration = Duration::from_secs(1);
+const AP_START_POLLS: u32 = 25;
 
 struct Config {
     ssid: String,
     once: bool,
     interval: Duration,
     quiet: bool,
+    hotspot: Option<Hotspot>,
+}
+
+/// Share the authenticated connection over a Wi-Fi hotspot, for the lifetime of
+/// this process. Started before the watch loop and torn down on exit, so the
+/// radio isn't left burning battery once sirensong stops.
+///
+/// The AP is a virtual interface on the same radio as the client. That survives
+/// a MAC rotation — verified on an ath11k card, where the AP held its channel
+/// while the station changed band, BSSID and MAC — provided the card advertises
+/// multi-channel concurrency and the regulatory domain permits beaconing.
+struct Hotspot {
+    ssid: String,
+    pass: String,
+    channel: u32,
 }
 
 fn print_help() {
@@ -51,6 +69,13 @@ fn print_help() {
          \x20   -q, --quiet            Only log errors (overrides RUST_LOG)\n\
          \x20   -h, --help             Print this help\n\
          \x20   -V, --version          Print version\n\n\
+         HOTSPOT (watch mode only, needs create_ap and root):\n\
+         \x20       --hotspot <SSID>       Share this connection over a Wi-Fi hotspot\n\
+         \x20       --hotspot-pass <PASS>  Passphrase (or set SIRENSONG_HOTSPOT_PASS)\n\
+         \x20       --hotspot-channel <N>  AP channel (default 1; keep it off the client's band)\n\n\
+         The hotspot is stopped when sirensong exits, so the radio doesn't keep\n\
+         draining battery. Prefer SIRENSONG_HOTSPOT_PASS over --hotspot-pass:\n\
+         arguments are visible to other users via ps.\n\n\
          Log verbosity is otherwise controlled by RUST_LOG (e.g. RUST_LOG=debug)."
     );
 }
@@ -60,12 +85,35 @@ fn parse_args_from<I: Iterator<Item = String>>(args: I) -> Result<Config, String
     let mut once = false;
     let mut interval = Duration::from_secs(60);
     let mut quiet = false;
+    let mut hotspot_ssid = None;
+    let mut hotspot_pass = None;
+    let mut hotspot_channel = 1u32;
     let mut args = args.peekable();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-o" | "--once" => once = true,
             "-q" | "--quiet" => quiet = true,
+            "--hotspot" => {
+                hotspot_ssid = Some(
+                    args.next()
+                        .ok_or_else(|| "--hotspot requires an SSID".to_string())?,
+                );
+            }
+            "--hotspot-pass" => {
+                hotspot_pass = Some(
+                    args.next()
+                        .ok_or_else(|| "--hotspot-pass requires a passphrase".to_string())?,
+                );
+            }
+            "--hotspot-channel" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| "--hotspot-channel requires a number".to_string())?;
+                hotspot_channel = val
+                    .parse()
+                    .map_err(|_| format!("invalid --hotspot-channel value: {val}"))?;
+            }
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -93,11 +141,39 @@ fn parse_args_from<I: Iterator<Item = String>>(args: I) -> Result<Config, String
         }
     }
 
+    // Env var is preferred over the flag: argv is world-readable via ps.
+    let hotspot = match hotspot_ssid {
+        None => None,
+        Some(hs_ssid) => {
+            let pass = hotspot_pass
+                .or_else(|| env::var("SIRENSONG_HOTSPOT_PASS").ok())
+                .ok_or_else(|| {
+                    "--hotspot needs a passphrase: set SIRENSONG_HOTSPOT_PASS or pass --hotspot-pass"
+                        .to_string()
+                })?;
+            if pass.len() < 8 {
+                return Err("hotspot passphrase must be at least 8 characters (WPA2)".to_string());
+            }
+            Some(Hotspot {
+                ssid: hs_ssid,
+                pass,
+                channel: hotspot_channel,
+            })
+        }
+    };
+
+    if hotspot.is_some() && once {
+        return Err(
+            "--hotspot needs watch mode; it would stop immediately under --once".to_string(),
+        );
+    }
+
     Ok(Config {
         ssid: ssid.unwrap_or_else(|| DEFAULT_SSID.to_string()),
         once,
         interval,
         quiet,
+        hotspot,
     })
 }
 
@@ -899,6 +975,120 @@ async fn reconcile(cfg: &Config) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Hotspot: share the authenticated link over a virtual AP on the same radio.
+// ---------------------------------------------------------------------------
+
+/// Name of the interface currently in AP mode, from an `iw dev` dump. `create_ap`
+/// names it `ap0` in practice, but it will pick another index if that's taken,
+/// so find it by mode rather than assuming.
+fn parse_ap_interface(iw_dev: &str) -> Option<String> {
+    let mut current: Option<&str> = None;
+    for line in iw_dev.lines() {
+        let t = line.trim();
+        if let Some(name) = t.strip_prefix("Interface ") {
+            current = Some(name.trim());
+        } else if t == "type AP" {
+            return current.map(str::to_string);
+        }
+    }
+    None
+}
+
+fn ap_interface() -> Option<String> {
+    let out = Command::new("iw").arg("dev").output().ok()?;
+    parse_ap_interface(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Whether the AP interface exists *and* is actually up. `create_ap` can leave a
+/// created-but-DISABLED interface behind when hostapd fails to pick an operating
+/// frequency — most often because the regulatory domain forbids beaconing on the
+/// chosen channel (`iw reg get` showing `country 00` is the usual culprit).
+fn ap_is_up() -> bool {
+    let Some(dev) = ap_interface() else {
+        return false;
+    };
+    Command::new("ip")
+        .args(["-br", "link", "show", &dev])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("UP"))
+        .unwrap_or(false)
+}
+
+/// Stops the hotspot when dropped, so it doesn't outlive sirensong and sit
+/// there draining battery. Covers clean exit, Ctrl-C and panics; nothing can
+/// cover SIGKILL.
+struct HotspotGuard {
+    iface: String,
+}
+
+impl Drop for HotspotGuard {
+    fn drop(&mut self) {
+        info!("stopping hotspot");
+        let stopped = Command::new("sudo")
+            .args(["create_ap", "--stop", &self.iface])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !stopped {
+            warn!(
+                iface = %self.iface,
+                "could not stop the hotspot; check with: sudo create_ap --stop {}",
+                self.iface
+            );
+        }
+    }
+}
+
+/// Bring up the hotspot on the same radio as the client connection. Returns a
+/// guard that tears it down on drop; `None` if it could not be started.
+fn hotspot_start(hs: &Hotspot) -> Option<HotspotGuard> {
+    let iface = wifi_device()?;
+    info!(
+        ssid = %hs.ssid,
+        channel = hs.channel,
+        "starting hotspot on {}", iface
+    );
+
+    let status = Command::new("sudo")
+        .args([
+            "create_ap",
+            "--daemon",
+            "-c",
+            &hs.channel.to_string(),
+            &iface,
+            &iface,
+            &hs.ssid,
+            &hs.pass,
+        ])
+        .status();
+    if !matches!(status, Ok(s) if s.success()) {
+        error!("could not launch create_ap (is it installed, and does sudo work here?)");
+        return None;
+    }
+
+    // Wait for it to actually beacon rather than assuming a duration — the
+    // interface can appear seconds before hostapd finishes, or never come up at
+    // all if the regulatory domain blocks the channel.
+    let guard = HotspotGuard {
+        iface: iface.clone(),
+    };
+    for _ in 0..AP_START_POLLS {
+        std::thread::sleep(AP_START_POLL);
+        if ap_is_up() {
+            info!(ssid = %hs.ssid, "hotspot is up — devices can join it now");
+            return Some(guard);
+        }
+    }
+
+    error!(
+        "hotspot interface never came up. Most often the regulatory domain forbids \
+         beaconing — check `iw reg get`; if it says `country 00`, set your country \
+         (e.g. `sudo iw reg set PH`) and retry"
+    );
+    None // guard drops here, cleaning up the half-started AP
+}
+
 /// Exponential backoff for watch mode: `interval * 2^(fails-1)`, capped.
 fn backoff_delay(base: Duration, fails: u32) -> Duration {
     let shift = fails.saturating_sub(1).min(16);
@@ -994,9 +1184,29 @@ async fn main() {
             std::process::exit(0);
         }
         std::process::exit(1);
-    } else {
-        run_watch(&cfg).await;
     }
+
+    // Held for the lifetime of the watch loop; dropping it stops the hotspot so
+    // the radio isn't left beaconing after we exit. `--once` is rejected at parse
+    // time, and that path uses process::exit, which would skip this anyway.
+    let _hotspot = match &cfg.hotspot {
+        None => None,
+        Some(hs) => match Backend::detect() {
+            Backend::GlRepeater => {
+                warn!("--hotspot ignored: this router already serves its own Wi-Fi");
+                None
+            }
+            Backend::NetworkManager => match hotspot_start(hs) {
+                Some(guard) => Some(guard),
+                None => {
+                    error!("could not start the hotspot; continuing without it");
+                    None
+                }
+            },
+        },
+    };
+
+    run_watch(&cfg).await;
 }
 
 #[cfg(test)]
@@ -1109,6 +1319,56 @@ mod tests {
             capture(form, r#"name="continue_url"[^>]*value="([^"]*)""#),
             Some("https%3A%2F%2Fwww.starbucks.ph%2F".to_string())
         );
+    }
+
+    // create_ap usually names it ap0, but picks another index if that's taken —
+    // so it has to be found by mode, not by name.
+    #[test]
+    fn finds_ap_interface_by_mode() {
+        let iw = "phy#0\n\tInterface ap0\n\t\tifindex 5\n\t\ttype AP\n\tInterface wlp2s0\n\t\tifindex 3\n\t\ttype managed\n";
+        assert_eq!(parse_ap_interface(iw).as_deref(), Some("ap0"));
+
+        let renamed = "phy#0\n\tInterface wlp2s0\n\t\ttype managed\n\tInterface ap1\n\t\ttype AP\n";
+        assert_eq!(parse_ap_interface(renamed).as_deref(), Some("ap1"));
+    }
+
+    #[test]
+    fn no_ap_interface_when_none_in_ap_mode() {
+        let iw = "phy#0\n\tInterface wlp2s0\n\t\tifindex 3\n\t\ttype managed\n";
+        assert_eq!(parse_ap_interface(iw), None);
+        assert_eq!(parse_ap_interface(""), None);
+    }
+
+    #[test]
+    fn hotspot_requires_a_passphrase() {
+        let err = cfg_from(&["--hotspot", "myap"]).err().unwrap();
+        assert!(err.contains("passphrase"), "got: {err}");
+    }
+
+    #[test]
+    fn hotspot_rejects_short_passphrase() {
+        let err = cfg_from(&["--hotspot", "myap", "--hotspot-pass", "short"])
+            .err()
+            .unwrap();
+        assert!(err.contains("8 characters"), "got: {err}");
+    }
+
+    // --once exits immediately, so a hotspot would be torn down the moment it
+    // came up. Better to say so than to silently do nothing useful.
+    #[test]
+    fn hotspot_conflicts_with_once() {
+        let err = cfg_from(&["--hotspot", "myap", "--hotspot-pass", "goodpass1", "--once"])
+            .err()
+            .unwrap();
+        assert!(err.contains("watch mode"), "got: {err}");
+    }
+
+    #[test]
+    fn hotspot_parses_with_defaults() {
+        let cfg = cfg_from(&["--hotspot", "myap", "--hotspot-pass", "goodpass1"]).unwrap();
+        let hs = cfg.hotspot.expect("hotspot configured");
+        assert_eq!(hs.ssid, "myap");
+        assert_eq!(hs.channel, 1);
     }
 
     #[test]
