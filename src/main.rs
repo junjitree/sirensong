@@ -54,8 +54,37 @@ struct Config {
 /// multi-channel concurrency and the regulatory domain permits beaconing.
 struct Hotspot {
     ssid: String,
-    pass: String,
+    /// Explicitly supplied passphrase. `None` means "use the remembered one, or
+    /// generate and remember a fresh one" — resolved at start rather than parse
+    /// time so that argument parsing stays free of side effects.
+    pass: Option<String>,
     channel: u32,
+}
+
+/// Trim an SSID to the 802.11 limit of 32 *bytes*, without splitting a character.
+fn truncate_ssid(name: &str) -> String {
+    if name.len() <= 32 {
+        return name.to_string();
+    }
+    let mut end = 32;
+    while end > 0 && !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name[..end].to_string()
+}
+
+/// Default hotspot name: `<hostname>-sirensong`, so it's recognisable among the
+/// dozen other networks in a café. Falls back to a bare `sirensong` if the
+/// hostname can't be read.
+fn default_hotspot_ssid() -> String {
+    let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|h| h.trim().to_string())
+        .unwrap_or_default();
+    if host.is_empty() {
+        "sirensong".to_string()
+    } else {
+        truncate_ssid(&format!("{host}-sirensong"))
+    }
 }
 
 fn print_help() {
@@ -70,12 +99,17 @@ fn print_help() {
          \x20   -h, --help             Print this help\n\
          \x20   -V, --version          Print version\n\n\
          HOTSPOT (watch mode only, needs create_ap and root):\n\
-         \x20       --hotspot <SSID>       Share this connection over a Wi-Fi hotspot\n\
-         \x20       --hotspot-pass <PASS>  Passphrase (or set SIRENSONG_HOTSPOT_PASS)\n\
+         \x20       --hotspot              Share this connection over a Wi-Fi hotspot\n\
+         \x20       --hotspot-ssid <NAME>  Network name (default: <hostname>-sirensong)\n\
+         \x20       --hotspot-pass <PASS>  Passphrase (or set SIRENSONG_HOTSPOT_PASS;\n\
+         \x20                              otherwise one is generated and remembered)\n\
          \x20       --hotspot-channel <N>  AP channel (default 1; keep it off the client's band)\n\n\
          The hotspot is stopped when sirensong exits, so the radio doesn't keep\n\
-         draining battery. Prefer SIRENSONG_HOTSPOT_PASS over --hotspot-pass:\n\
-         arguments are visible to other users via ps.\n\n\
+         draining battery. A generated passphrase is saved to\n\
+         ~/.config/sirensong/hotspot.pass so devices only pair once, and the\n\
+         credentials print as a QR code you can scan to join.\n\
+         Prefer SIRENSONG_HOTSPOT_PASS over --hotspot-pass: arguments are\n\
+         visible to other users via ps.\n\n\
          Log verbosity is otherwise controlled by RUST_LOG (e.g. RUST_LOG=debug)."
     );
 }
@@ -85,6 +119,7 @@ fn parse_args_from<I: Iterator<Item = String>>(args: I) -> Result<Config, String
     let mut once = false;
     let mut interval = Duration::from_secs(60);
     let mut quiet = false;
+    let mut hotspot = false;
     let mut hotspot_ssid = None;
     let mut hotspot_pass = None;
     let mut hotspot_channel = 1u32;
@@ -94,10 +129,11 @@ fn parse_args_from<I: Iterator<Item = String>>(args: I) -> Result<Config, String
         match arg.as_str() {
             "-o" | "--once" => once = true,
             "-q" | "--quiet" => quiet = true,
-            "--hotspot" => {
+            "--hotspot" => hotspot = true,
+            "--hotspot-ssid" => {
                 hotspot_ssid = Some(
                     args.next()
-                        .ok_or_else(|| "--hotspot requires an SSID".to_string())?,
+                        .ok_or_else(|| "--hotspot-ssid requires a name".to_string())?,
                 );
             }
             "--hotspot-pass" => {
@@ -141,25 +177,23 @@ fn parse_args_from<I: Iterator<Item = String>>(args: I) -> Result<Config, String
         }
     }
 
+    if hotspot_ssid.is_some() && !hotspot {
+        return Err("--hotspot-ssid does nothing without --hotspot".to_string());
+    }
+
     // Env var is preferred over the flag: argv is world-readable via ps.
-    let hotspot = match hotspot_ssid {
-        None => None,
-        Some(hs_ssid) => {
-            let pass = hotspot_pass
-                .or_else(|| env::var("SIRENSONG_HOTSPOT_PASS").ok())
-                .ok_or_else(|| {
-                    "--hotspot needs a passphrase: set SIRENSONG_HOTSPOT_PASS or pass --hotspot-pass"
-                        .to_string()
-                })?;
-            if pass.len() < 8 {
-                return Err("hotspot passphrase must be at least 8 characters (WPA2)".to_string());
-            }
-            Some(Hotspot {
-                ssid: hs_ssid,
-                pass,
-                channel: hotspot_channel,
-            })
+    let hotspot = if !hotspot {
+        None
+    } else {
+        let pass = hotspot_pass.or_else(|| env::var("SIRENSONG_HOTSPOT_PASS").ok());
+        if pass.as_deref().is_some_and(|p| p.len() < 8) {
+            return Err("hotspot passphrase must be at least 8 characters (WPA2)".to_string());
         }
+        Some(Hotspot {
+            ssid: hotspot_ssid.unwrap_or_else(default_hotspot_ssid),
+            pass,
+            channel: hotspot_channel,
+        })
     };
 
     if hotspot.is_some() && once {
@@ -1040,10 +1074,106 @@ impl Drop for HotspotGuard {
     }
 }
 
+/// Where a generated passphrase is remembered, so the phone pairs once and
+/// reconnects on its own from then on.
+fn hotspot_pass_path() -> Option<std::path::PathBuf> {
+    let home = env::var("HOME").ok()?;
+    Some(std::path::PathBuf::from(home).join(".config/sirensong/hotspot.pass"))
+}
+
+/// A random passphrase drawn from an alphabet with the ambiguous glyphs removed
+/// (no `0`/`O`, no `1`/`l`/`I`), so it survives being read off a screen. 20
+/// characters of this is ~115 bits, well beyond anything WPA2 needs.
+fn generate_passphrase() -> Option<String> {
+    use std::io::Read;
+    const ALPHABET: &[u8] = b"abcdefghijkmnopqrstuvwxyzACDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut buf = [0u8; 20];
+    std::fs::File::open("/dev/urandom")
+        .ok()?
+        .read_exact(&mut buf)
+        .ok()?;
+    Some(
+        buf.iter()
+            .map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char)
+            .collect(),
+    )
+}
+
+/// Resolve the passphrase: an explicit one wins, else reuse what we generated
+/// last time, else generate one and remember it (owner-readable only).
+fn resolve_passphrase(explicit: Option<&String>) -> Option<String> {
+    if let Some(p) = explicit {
+        return Some(p.clone());
+    }
+    let path = hotspot_pass_path()?;
+
+    if let Ok(stored) = std::fs::read_to_string(&path) {
+        let stored = stored.trim().to_string();
+        if stored.len() >= 8 {
+            debug!(path = %path.display(), "reusing remembered hotspot passphrase");
+            return Some(stored);
+        }
+    }
+
+    let generated = generate_passphrase()?;
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    match std::fs::write(&path, format!("{generated}\n")) {
+        Ok(()) => {
+            // Best effort: a passphrase readable by other users is not a secret.
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            info!(path = %path.display(), "generated a hotspot passphrase and saved it");
+        }
+        Err(e) => warn!(error = %e, "could not save the passphrase; it will differ next run"),
+    }
+    Some(generated)
+}
+
+/// Escape the delimiters that matter in a `WIFI:` provisioning URI.
+fn escape_wifi_uri(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | ';' | ',' | ':' | '"') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Print the credentials plus a QR code, so joining is "point the camera at it"
+/// rather than typing 20 random characters on a phone keyboard.
+fn print_join_details(ssid: &str, pass: &str) {
+    use qrcode::QrCode;
+    use qrcode::render::unicode;
+
+    let uri = format!(
+        "WIFI:S:{};T:WPA;P:{};;",
+        escape_wifi_uri(ssid),
+        escape_wifi_uri(pass)
+    );
+    println!("\n  network:  {ssid}\n  password: {pass}\n");
+    match QrCode::new(&uri) {
+        Ok(code) => {
+            let art = code
+                .render::<unicode::Dense1x2>()
+                .quiet_zone(true)
+                .module_dimensions(1, 1)
+                .build();
+            println!("{art}");
+            println!("  scan with your phone's camera to join\n");
+        }
+        Err(e) => debug!(error = %e, "could not render the QR code"),
+    }
+}
+
 /// Bring up the hotspot on the same radio as the client connection. Returns a
 /// guard that tears it down on drop; `None` if it could not be started.
 fn hotspot_start(hs: &Hotspot) -> Option<HotspotGuard> {
     let iface = wifi_device()?;
+    let pass = resolve_passphrase(hs.pass.as_ref())?;
     info!(
         ssid = %hs.ssid,
         channel = hs.channel,
@@ -1059,7 +1189,7 @@ fn hotspot_start(hs: &Hotspot) -> Option<HotspotGuard> {
             &iface,
             &iface,
             &hs.ssid,
-            &hs.pass,
+            &pass,
         ])
         .status();
     if !matches!(status, Ok(s) if s.success()) {
@@ -1076,7 +1206,8 @@ fn hotspot_start(hs: &Hotspot) -> Option<HotspotGuard> {
     for _ in 0..AP_START_POLLS {
         std::thread::sleep(AP_START_POLL);
         if ap_is_up() {
-            info!(ssid = %hs.ssid, "hotspot is up — devices can join it now");
+            info!(ssid = %hs.ssid, "hotspot is up");
+            print_join_details(&hs.ssid, &pass);
             return Some(guard);
         }
     }
@@ -1340,35 +1471,84 @@ mod tests {
     }
 
     #[test]
-    fn hotspot_requires_a_passphrase() {
-        let err = cfg_from(&["--hotspot", "myap"]).err().unwrap();
-        assert!(err.contains("passphrase"), "got: {err}");
-    }
-
-    #[test]
     fn hotspot_rejects_short_passphrase() {
-        let err = cfg_from(&["--hotspot", "myap", "--hotspot-pass", "short"])
+        let err = cfg_from(&["--hotspot", "--hotspot-pass", "short"])
             .err()
             .unwrap();
         assert!(err.contains("8 characters"), "got: {err}");
+    }
+
+    // Naming a hotspot you never asked to start is a typo, not an intent.
+    #[test]
+    fn hotspot_ssid_without_hotspot_is_an_error() {
+        let err = cfg_from(&["--hotspot-ssid", "myap"]).err().unwrap();
+        assert!(err.contains("without --hotspot"), "got: {err}");
     }
 
     // --once exits immediately, so a hotspot would be torn down the moment it
     // came up. Better to say so than to silently do nothing useful.
     #[test]
     fn hotspot_conflicts_with_once() {
-        let err = cfg_from(&["--hotspot", "myap", "--hotspot-pass", "goodpass1", "--once"])
+        let err = cfg_from(&["--hotspot", "--hotspot-pass", "goodpass1", "--once"])
             .err()
             .unwrap();
         assert!(err.contains("watch mode"), "got: {err}");
     }
 
+    // No passphrase is an error no longer: one gets generated and remembered.
     #[test]
-    fn hotspot_parses_with_defaults() {
-        let cfg = cfg_from(&["--hotspot", "myap", "--hotspot-pass", "goodpass1"]).unwrap();
+    fn hotspot_defaults_to_hostname_name_and_channel_one() {
+        let cfg = cfg_from(&["--hotspot"]).unwrap();
         let hs = cfg.hotspot.expect("hotspot configured");
-        assert_eq!(hs.ssid, "myap");
+        assert_eq!(hs.ssid, default_hotspot_ssid());
+        assert!(hs.ssid.ends_with("sirensong"), "got: {}", hs.ssid);
         assert_eq!(hs.channel, 1);
+        assert!(hs.pass.is_none(), "resolved at start, not at parse time");
+    }
+
+    #[test]
+    fn generated_passphrase_is_long_and_unambiguous() {
+        let p = generate_passphrase().expect("should read /dev/urandom");
+        assert_eq!(p.len(), 20);
+        // The confusable pairs are removed by dropping one side of each:
+        // 0/O, 1/l/I, 8/B. Lowercase `o` stays — nothing it can be mistaken for.
+        for bad in ['0', 'O', '1', 'l', 'I', 'B'] {
+            assert!(!p.contains(bad), "ambiguous glyph {bad} in {p}");
+        }
+        assert_ne!(p, generate_passphrase().unwrap(), "should not be constant");
+    }
+
+    // The delimiters in a WIFI: URI have to be escaped or a password containing
+    // one would silently produce a QR code that joins the wrong thing.
+    #[test]
+    fn wifi_uri_escapes_delimiters() {
+        assert_eq!(escape_wifi_uri("plain"), "plain");
+        assert_eq!(escape_wifi_uri("a;b"), "a\\;b");
+        assert_eq!(escape_wifi_uri("a:b,c"), "a\\:b\\,c");
+        assert_eq!(escape_wifi_uri("back\\slash"), "back\\\\slash");
+    }
+
+    #[test]
+    fn hotspot_ssid_can_be_overridden() {
+        let cfg = cfg_from(&[
+            "--hotspot",
+            "--hotspot-ssid",
+            "myap",
+            "--hotspot-pass",
+            "goodpass1",
+        ])
+        .unwrap();
+        assert_eq!(cfg.hotspot.expect("configured").ssid, "myap");
+    }
+
+    #[test]
+    fn ssid_truncation_respects_char_boundaries() {
+        assert_eq!(truncate_ssid("short"), "short");
+        assert_eq!(truncate_ssid(&"a".repeat(40)).len(), 32);
+        // 2 bytes per char: must not be split mid-character
+        let cut = truncate_ssid(&"é".repeat(20));
+        assert!(cut.len() <= 32);
+        assert!(cut.chars().all(|c| c == 'é'));
     }
 
     #[test]
