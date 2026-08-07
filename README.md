@@ -141,8 +141,8 @@ first run a 20-character passphrase is generated and saved to
 code — point your phone's camera at it to join, no typing:
 
 ```
-  network:  junji-t14-sirensong
-  password: bTrVVK2T5wuAKtaKqs2c
+  network:  hostname-sirensong
+  password: AbCdEfGhJkMnPqRsTuVw
 
   █▀▀▀▀▀█ ▀▀ █▄█▄▀█▄▀ ▄▄▄   █▀▀▀▀▀█
   ...
