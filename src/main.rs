@@ -22,6 +22,16 @@ const MAX_BACKOFF: Duration = Duration::from_secs(900);
 /// look like `n143.network-auth.com`). This is how we recognize *our* portal
 /// without ever asking which network we are on.
 const PORTAL_HOST: &str = "network-auth.com";
+/// Poll interval while waiting for a rotated repeater to come back.
+const ROTATE_POLL: Duration = Duration::from_secs(2);
+/// Give up after this many polls with no observable progress — no change in the
+/// daemon's state and no change in the live MAC. This is a *stall* detector, not
+/// a duration budget: how long a reconnect takes varies by minutes between a
+/// quiet network and a busy café, so we wait on evidence rather than a guess.
+const ROTATE_STALL_POLLS: u32 = 30;
+/// Absolute backstop so a wedged daemon can't block the watch loop forever.
+/// Should never be reached; the stall detector is the real mechanism.
+const ROTATE_MAX_POLLS: u32 = 300;
 
 struct Config {
     ssid: String,
@@ -310,6 +320,274 @@ fn ensure_random_mac(ssid: &str) -> bool {
     ok
 }
 
+// ---------------------------------------------------------------------------
+// GL.iNet OpenWrt backend
+//
+// On a GL.iNet travel router the Wi-Fi link belongs to the `gl-repeater` daemon
+// rather than NetworkManager, and the Qualcomm driver only accepts a station MAC
+// at the moment it *creates* the vdev — changing it afterwards updates the netdev
+// but not the radio, and association then fails on a 4-way handshake mismatch.
+// Since vdev creation happens when the daemon starts, rotating means writing the
+// new address into UCI and restarting the daemon. That takes ~30s and, unlike
+// GL.iNet's own `ubus call repeater connect`, does not reboot the device.
+// ---------------------------------------------------------------------------
+
+/// Which stack owns the Wi-Fi link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    /// Desktop Linux: NetworkManager via `nmcli`.
+    NetworkManager,
+    /// GL.iNet OpenWrt: the `gl-repeater` daemon via `uci`.
+    GlRepeater,
+}
+
+impl Backend {
+    /// Pick a backend from what is actually installed, so one binary serves both.
+    fn detect() -> Self {
+        if std::path::Path::new("/etc/init.d/repeater").exists() {
+            Backend::GlRepeater
+        } else {
+            Backend::NetworkManager
+        }
+    }
+}
+
+/// A random locally-administered unicast MAC — bit 1 of the first octet set,
+/// bit 0 clear. Globally-administered or multicast addresses are rejected (GL.iNet's
+/// own UI warns the second hex digit may not be odd).
+fn random_laa_mac() -> Option<String> {
+    use std::io::Read;
+    let mut buf = [0u8; 6];
+    std::fs::File::open("/dev/urandom")
+        .ok()?
+        .read_exact(&mut buf)
+        .ok()?;
+    buf[0] = (buf[0] & 0xFE) | 0x02;
+    Some(
+        buf.iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(":"),
+    )
+}
+
+fn uci_get(key: &str) -> Option<String> {
+    let out = Command::new("uci").args(["-q", "get", key]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if v.is_empty() { None } else { Some(v) }
+}
+
+fn uci_set(key: &str, val: &str) -> bool {
+    Command::new("uci")
+        .args(["set", &format!("{key}={val}")])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn uci_commit(pkg: &str) -> bool {
+    Command::new("uci")
+        .args(["commit", pkg])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Index of the saved repeater network with this SSID. The list is positional,
+/// so it must be resolved by name — never hardcoded.
+fn repeater_index(ssid: &str) -> Option<usize> {
+    (0..16).find(|i| uci_get(&format!("repeater.@network[{i}].ssid")).as_deref() == Some(ssid))
+}
+
+/// SSID from a `ubus call repeater status` payload. Hand-rolled rather than
+/// pulling in a JSON dependency for one field.
+fn parse_repeater_ssid(status_json: &str) -> Option<String> {
+    let at = status_json.find("\"ssid\"")?;
+    let rest = &status_json[at + 6..];
+    let open = rest.find('"')?;
+    let tail = &rest[open + 1..];
+    let close = tail.find('"')?;
+    let ssid = &tail[..close];
+    if ssid.is_empty() {
+        None
+    } else {
+        Some(ssid.to_string())
+    }
+}
+
+/// The daemon's own view of the link — `connecting`, `connected`, `failed`.
+/// Watching this beats timing the reconnect, because it reports progress rather
+/// than requiring us to guess a duration.
+fn parse_repeater_state(status_json: &str) -> Option<String> {
+    let at = status_json.find("\"state_s\"")?;
+    let rest = &status_json[at + 9..];
+    let open = rest.find('"')?;
+    let tail = &rest[open + 1..];
+    let close = tail.find('"')?;
+    Some(tail[..close].to_string())
+}
+
+fn repeater_status() -> Option<String> {
+    let out = Command::new("ubus")
+        .args(["call", "repeater", "status"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn repeater_ssid() -> Option<String> {
+    parse_repeater_ssid(&repeater_status()?)
+}
+
+fn repeater_state() -> Option<String> {
+    parse_repeater_state(&repeater_status()?)
+}
+
+/// MAC field from a single `ip -br link show <dev>` line, lowercased.
+fn parse_link_mac(line: &str) -> Option<String> {
+    line.split_whitespace().nth(2).map(str::to_lowercase)
+}
+
+fn link_mac(dev: &str) -> Option<String> {
+    let out = Command::new("ip")
+        .args(["-br", "link", "show", dev])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_link_mac(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn default_route_present() -> bool {
+    Command::new("ip")
+        .args(["route", "show", "default"])
+        .output()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+/// Rotate the repeater's MAC and wait for the link to come back on it.
+///
+/// Writes the address to both places the daemon reads, then restarts the daemon
+/// so it recreates the station vdev with the new address. Returns once the
+/// station is up on that MAC with a default route — typically ~30s.
+fn rotate_repeater(cfg: &Config) -> bool {
+    let Some(idx) = repeater_index(&cfg.ssid) else {
+        error!("no saved network on the router for {}", cfg.ssid);
+        return false;
+    };
+    let Some(new_mac) = random_laa_mac() else {
+        error!("could not generate a MAC address");
+        return false;
+    };
+
+    let before = uci_get("wireless.sta.ifname").as_deref().and_then(link_mac);
+    debug!(
+        idx,
+        attached_to = current_ssid().as_deref().unwrap_or("?"),
+        before = before.as_deref().unwrap_or("?"),
+        new = %new_mac,
+        "rotating repeater MAC"
+    );
+
+    let writes = [
+        (
+            format!("repeater.@network[{idx}].macaddr"),
+            format!("r,{new_mac}"),
+        ),
+        ("wireless.sta.macaddr".to_string(), new_mac.clone()),
+    ];
+    for (key, val) in &writes {
+        if !uci_set(key, val) {
+            error!("could not write {key}");
+            return false;
+        }
+    }
+    for pkg in ["repeater", "wireless"] {
+        if !uci_commit(pkg) {
+            error!("could not commit {pkg} config");
+            return false;
+        }
+    }
+
+    // The daemon applies the MAC when it starts; a device reboot is not needed.
+    let restarted = Command::new("/etc/init.d/repeater")
+        .arg("restart")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !restarted {
+        error!("could not restart the repeater daemon");
+        return false;
+    }
+
+    // Wait on evidence, not on the clock. A reconnect takes ~30s on a quiet
+    // network and several minutes on a busy one, so watch the daemon's state and
+    // the live MAC, and only give up once nothing is moving. The interface name
+    // flips between sta0/sta1 across restarts, so re-read it every poll.
+    let want = new_mac.to_lowercase();
+    let mut last = String::new();
+    let mut stalled = 0u32;
+
+    for poll in 0..ROTATE_MAX_POLLS {
+        std::thread::sleep(ROTATE_POLL);
+
+        let state = repeater_state().unwrap_or_default();
+        let live = uci_get("wireless.sta.ifname")
+            .as_deref()
+            .and_then(link_mac)
+            .unwrap_or_default();
+
+        if live == want && default_route_present() {
+            debug!(mac = %want, polls = poll + 1, "repeater back up on the rotated MAC");
+            return true;
+        }
+
+        // `failed` is transient, not terminal: the daemon reports it between
+        // retries and then keeps going, so treating it as fatal aborts a
+        // reconnect that would have succeeded (observed recovering ~8 minutes
+        // later on a congested network). Let the stall detector decide instead —
+        // an oscillation between `connecting` and `failed` is the daemon
+        // working, whereas sitting in one state with nothing moving is not.
+        let seen = format!("{state}|{live}");
+        if state == "connecting" || seen != last {
+            stalled = 0;
+            last = seen;
+        } else {
+            stalled += 1;
+            if stalled >= ROTATE_STALL_POLLS {
+                warn!(state = %state, mac = %live, "repeater stopped making progress");
+                return false;
+            }
+        }
+    }
+    warn!("repeater never settled; giving up so the watch loop can retry");
+    false
+}
+
+/// The network we are currently attached to, however the platform reports it.
+fn current_ssid() -> Option<String> {
+    match Backend::detect() {
+        Backend::GlRepeater => repeater_ssid(),
+        Backend::NetworkManager => active_ssid(),
+    }
+}
+
+/// Get onto the target network with a fresh MAC, using whichever stack is present.
+fn connect_to_wifi(cfg: &Config) -> bool {
+    match Backend::detect() {
+        Backend::GlRepeater => rotate_repeater(cfg),
+        Backend::NetworkManager => connect_via_networkmanager(cfg),
+    }
+}
+
 /// (Re)connect to the Wi-Fi, forcing a fresh activation so NetworkManager rolls
 /// a new randomized MAC (`wifi.cloned-mac-address=random`). The new MAC is what
 /// lets us re-authenticate past the captive portal's per-device usage cap — the
@@ -317,7 +595,7 @@ fn ensure_random_mac(ssid: &str) -> bool {
 ///
 /// Tries an existing saved profile first (`connection down` then `up`), then
 /// falls back to associating with an open network (`dev wifi connect`).
-fn connect_to_wifi(cfg: &Config) -> bool {
+fn connect_via_networkmanager(cfg: &Config) -> bool {
     debug!(ssid = %cfg.ssid, "cycling connection for fresh MAC");
 
     let dev = wifi_device();
@@ -896,6 +1174,81 @@ mod tests {
         assert!(ok, "http_login should complete the mock portal flow");
         // MockServer's Drop verifies the POST expectation (exactly 1 hit with
         // the right token + plan), so a wrong token would fail the test.
+    }
+
+    // The driver (and GL.iNet's own UI) reject anything that isn't a
+    // locally-administered unicast address, so the bit fiddling has to be right.
+    #[test]
+    fn generated_mac_is_locally_administered_unicast() {
+        for _ in 0..20 {
+            let mac = random_laa_mac().expect("should read /dev/urandom");
+            let octets: Vec<u8> = mac
+                .split(':')
+                .map(|o| u8::from_str_radix(o, 16).expect("hex octet"))
+                .collect();
+            assert_eq!(octets.len(), 6, "six octets: {mac}");
+            assert_eq!(
+                octets[0] & 0x02,
+                0x02,
+                "locally administered bit set: {mac}"
+            );
+            assert_eq!(
+                octets[0] & 0x01,
+                0x00,
+                "unicast (multicast bit clear): {mac}"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_mac_from_ip_br_link() {
+        let line =
+            "sta1             UP             02:6a:4c:3c:b1:79 <BROADCAST,MULTICAST,UP,LOWER_UP>";
+        assert_eq!(parse_link_mac(line).as_deref(), Some("02:6a:4c:3c:b1:79"));
+        assert_eq!(parse_link_mac("").as_deref(), None);
+    }
+
+    // The daemon reports the SSID nested in a `config` object; we want the first
+    // occurrence and nothing else.
+    #[test]
+    fn reads_ssid_from_repeater_status() {
+        let json = r#"{
+            "state": 1,
+            "state_s": "connected",
+            "config": {
+                "disguise": false,
+                "ssid": "Starbucks Customer",
+                "macaddr": { "mode": "random" }
+            }
+        }"#;
+        assert_eq!(
+            parse_repeater_ssid(json).as_deref(),
+            Some("Starbucks Customer")
+        );
+    }
+
+    // The daemon's state is what we wait on instead of timing the reconnect.
+    #[test]
+    fn reads_state_from_repeater_status() {
+        let connecting = r#"{"state": 1, "state_s": "connecting", "running": true}"#;
+        let connected = r#"{"state": 2, "state_s": "connected", "config": {}}"#;
+        let failed = r#"{"state_s": "failed", "fail_type": "auth"}"#;
+        assert_eq!(
+            parse_repeater_state(connecting).as_deref(),
+            Some("connecting")
+        );
+        assert_eq!(
+            parse_repeater_state(connected).as_deref(),
+            Some("connected")
+        );
+        assert_eq!(parse_repeater_state(failed).as_deref(), Some("failed"));
+        assert_eq!(parse_repeater_state("{}"), None);
+    }
+
+    #[test]
+    fn repeater_ssid_absent_or_empty_is_none() {
+        assert_eq!(parse_repeater_ssid("{}"), None);
+        assert_eq!(parse_repeater_ssid(r#"{"ssid": ""}"#), None);
     }
 
     #[test]
