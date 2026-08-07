@@ -5,6 +5,21 @@ Starbucks Wi-Fi captive portals. It authenticates over plain HTTP and rolls a
 fresh MAC address on each reconnect, so the portal's per-device time limit never
 runs out.
 
+**Which Starbucks?** The ones running a **Cisco Meraki free-plan splash.** There
+is no single worldwide Starbucks portal — markets are run by different
+licensees, and each picks its own captive-portal vendor. So this working at your
+Starbucks says nothing about the one in the next country, and possibly not the
+next city. Check before assuming:
+
+```bash
+RUST_LOG=debug sirensong --once
+```
+
+The log names the portal it found and whether it could use it.
+`no Meraki free-plan form on this splash page` means a different vendor, or
+Meraki running vouchers, click-through terms, or SMS instead — none of which are
+supported.
+
 ## Prerequisites
 
 - `nmcli` (NetworkManager command-line tool)
@@ -127,9 +142,20 @@ portal — a hotel or airport — is left alone too.
 
 ### Sharing the connection (`--hotspot`)
 
-One café login, several devices. sirensong can bring up a Wi-Fi hotspot on the
-same radio it is already using, so your phone rides the connection it keeps
-authenticated:
+**Your phone is capped even when your laptop isn't.** MAC rotation gives the
+machine running sirensong an unlimited session, but every other device you own
+still gets the portal's usual hour and then stops. Phones can't escape that on
+their own: iOS randomizes its MAC per network, but the address is _stable for
+that SSID_, so the portal recognizes it on every visit and resumes the same
+clock. Rotating it means "Forget This Network" and rejoining by hand, once an
+hour.
+
+`--hotspot` removes the problem instead of automating it. sirensong brings up a
+Wi-Fi hotspot on the radio it is already using, and devices that join it reach
+the internet through your machine's NAT — so **they never speak to the portal at
+all**. The only MAC the café ever sees is the one sirensong is already rotating,
+and one rotation covers everything behind the hotspot, however many devices that
+is.
 
 ```bash
 sirensong --hotspot
