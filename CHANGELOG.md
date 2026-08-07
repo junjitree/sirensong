@@ -8,6 +8,40 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **Share the connection over a Wi-Fi hotspot** (`--hotspot`): brings up an AP
+  on the same radio for the lifetime of the process, so one café login serves
+  your phone too. Off unless asked for. The network is named
+  `<hostname>-sirensong` (`--hotspot-ssid` to override) and a 20-character
+  passphrase is generated on first use and remembered in
+  `~/.config/sirensong/hotspot.pass` (mode `0600`), so devices pair once rather
+  than on every run. `--hotspot-pass` and `SIRENSONG_HOTSPOT_PASS` take
+  precedence, in that order; prefer the environment variable, since arguments
+  are readable by other users via `ps`. Credentials print with a QR code in the
+  standard `WIFI:` provisioning format, so joining is pointing a camera rather
+  than typing twenty random characters on a phone.
+- **The hotspot stops when sirensong stops**, so the radio isn't left beaconing
+  and draining battery — via a `Drop` guard, covering clean exit, Ctrl-C,
+  `SIGTERM` and panics (not `SIGKILL`). The watch loop also checks the AP each
+  tick and restarts it if it died, since otherwise devices behind it lose
+  network with nothing to say why. Liveness is a single
+  `/sys/class/net/<iface>/operstate` read rather than spawning `iw` and `ip`
+  (~6.6 ms measured) each poll.
+- A warning before starting when the regulatory domain is `country 00`, under
+  which most channels forbid transmitting. That is the cause of hostapd's
+  otherwise opaque "could not determine operating frequency", and the warning
+  names the fix.
+- **Experimental: GL.iNet travel routers as a second backend**, selected at
+  runtime by the presence of `/etc/init.d/repeater`. Rotation there writes the
+  new MAC into UCI and restarts the `gl-repeater` daemon, which applies it when
+  it recreates the station vdev — roughly 30s, and without the device reboot
+  GL.iNet's own `ubus repeater connect` performs. Waiting is driven by the
+  daemon's reported state rather than a fixed duration, because a reconnect
+  takes ~30s on a quiet network and minutes on a busy one. **Not yet validated
+  end-to-end against a live portal**; the NetworkManager path is untouched and
+  unaffected.
+
 ## [0.1.2] - 2026-07-30
 
 ### Fixed

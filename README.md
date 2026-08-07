@@ -77,6 +77,11 @@ sirensong [OPTIONS] [SSID]
   -q, --quiet            Only log errors (overrides RUST_LOG)
   -h, --help             Print help
   -V, --version          Print version
+
+      --hotspot              Share this connection over a Wi-Fi hotspot
+      --hotspot-ssid <NAME>  Network name (default: <hostname>-sirensong)
+      --hotspot-pass <PASS>  Passphrase (or set SIRENSONG_HOTSPOT_PASS)
+      --hotspot-channel <N>  AP channel (default 1)
 ```
 
 By default it logs plain status lines — when you are watching, when you are good
@@ -119,6 +124,64 @@ while a network whose uplink is simply down replies with nothing at all. So if
 you walk away and forget to stop it, and your home internet later drops, it sees
 silence rather than a portal and leaves your connection alone. An unfamiliar
 portal — a hotel or airport — is left alone too.
+
+### Sharing the connection (`--hotspot`)
+
+One café login, several devices. sirensong can bring up a Wi-Fi hotspot on the
+same radio it is already using, so your phone rides the connection it keeps
+authenticated:
+
+```bash
+sirensong --hotspot
+```
+
+That is the whole command. The network is named `<hostname>-sirensong`, and on
+first run a 20-character passphrase is generated and saved to
+`~/.config/sirensong/hotspot.pass` (mode `0600`). Credentials print with a QR
+code — point your phone's camera at it to join, no typing:
+
+```
+  network:  junji-t14-sirensong
+  password: bTrVVK2T5wuAKtaKqs2c
+
+  █▀▀▀▀▀█ ▀▀ █▄█▄▀█▄▀ ▄▄▄   █▀▀▀▀▀█
+  ...
+
+  scan with your phone's camera to join
+```
+
+The passphrase is **remembered**, so devices pair once and reconnect on their
+own after that. Override with `--hotspot-pass`, or `SIRENSONG_HOTSPOT_PASS` —
+prefer the environment variable, since command-line arguments are visible to
+other users via `ps`.
+
+**The hotspot stops when sirensong stops.** Ctrl-C tears it down rather than
+leaving the radio beaconing and draining battery. That covers clean exit,
+Ctrl-C, `SIGTERM` and panics — but not `kill -9`, after which you would need
+`sudo create_ap --stop <iface>`. If the AP dies on its own mid-session, the
+watch loop notices within one poll and restarts it.
+
+Requirements:
+
+- [`create_ap`](https://github.com/lakinduakash/linux-wifi-hotspot) and
+  `dnsmasq`
+- `sudo` (prompts in your terminal, so run it interactively rather than
+  backgrounded)
+- A card that can run AP and client modes at once — check `iw phy phyN info` for
+  `valid interface combinations` listing `{ managed }` alongside `{ AP }`
+- **A regulatory domain that permits transmitting.** If `iw reg get` reports
+  `country 00`, most channels are `no IR` and the hotspot will fail with an
+  opaque hostapd error. Set your country and persist it:
+
+  ```bash
+  sudo iw reg set PH
+  echo 'options cfg80211 ieee80211_regdom=PH' | sudo tee /etc/modprobe.d/cfg80211.conf
+  ```
+
+Rotating the MAC does not disturb the hotspot: the AP is a separate virtual
+interface, and on a card with multi-channel concurrency it holds its channel
+while the client reassociates. Devices stay connected and only lose internet for
+the length of the reconnect.
 
 ### How re-auth works (MAC rotation)
 
