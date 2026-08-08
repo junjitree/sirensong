@@ -303,6 +303,12 @@ uci set repeater.@network[N].auto_portal='0'   # find N by SSID, don't hardcode
 uci commit repeater
 ```
 
+The service files themselves — `sirensong.init`, `sirensong.config` and an
+optional handler that toggles sirensong from the router's hardware slider — live
+in [`router/`](router/), along with install steps and a post-reflash checklist
+of the settings that a firmware upgrade or factory reset silently restores to
+their defaults.
+
 ### How re-auth works (MAC rotation)
 
 Captive portals cap usage **per device (MAC address)**. When connectivity drops,
