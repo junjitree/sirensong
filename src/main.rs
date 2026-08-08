@@ -1520,6 +1520,14 @@ fn channel_for_freq(mhz: u32) -> Option<u32> {
 /// just fails. Asking the user to look up their channel and pass it is the tool
 /// refusing to read something it can see.
 fn station_channel(dev: &str) -> Option<u32> {
+    station_freq(dev).and_then(channel_for_freq)
+}
+
+/// The frequency (MHz) the Wi-Fi station is currently associated on.
+///
+/// Frequency rather than channel is the honest unit here: channel numbers repeat
+/// across bands, so `161` alone cannot say whether it means 5805 MHz or 6755 MHz.
+fn station_freq(dev: &str) -> Option<u32> {
     let out = Command::new("iw")
         .args(["dev", dev, "link"])
         .output()
@@ -1527,7 +1535,7 @@ fn station_channel(dev: &str) -> Option<u32> {
     if !out.status.success() {
         return None;
     }
-    parse_link_freq(&String::from_utf8_lossy(&out.stdout)).and_then(channel_for_freq)
+    parse_link_freq(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// `\tfreq: 5805.0` -> `5805`.
@@ -1811,23 +1819,28 @@ fn print_join_details(ssid: &str, pass: &str) {
     }
 }
 
-/// Channels this radio may *initiate* radiation on, i.e. host an AP on.
+/// Frequencies (MHz) this radio may *initiate* radiation on, i.e. host an AP on.
 ///
-/// A channel flagged `no IR` can be associated to as a client but never beaconed
-/// on. Under some regulatory domains that covers the entire 5GHz band, so a card
-/// happily connected on 5GHz cannot host a hotspot there at all — and cannot
-/// host one on 2.4GHz either, because that would put the AP on a second channel,
-/// which most cards only allow in a restricted mode that fails to start.
-fn ap_capable_channels() -> Vec<u32> {
+/// A frequency flagged `no IR` can be associated to as a client but never
+/// beaconed on. Under some regulatory domains that covers the entire 5GHz band,
+/// so a card happily connected on 5GHz cannot host a hotspot there at all — and
+/// cannot host one on 2.4GHz either, because that puts the AP on a second
+/// channel, which most cards only allow in a restricted mode that fails to start.
+///
+/// Frequencies, not channel numbers: channel numbering repeats across bands. On
+/// a Wi-Fi 6E card, channel 161 is both 5805 MHz (`no IR` here) and 6755 MHz
+/// (usable) — collecting bare channel numbers made an unusable station channel
+/// look fine, and this check silently did nothing.
+fn ap_capable_freqs() -> Vec<u32> {
     let Ok(out) = Command::new("iw").arg("phy").output() else {
         return Vec::new();
     };
-    parse_ap_capable_channels(&String::from_utf8_lossy(&out.stdout))
+    parse_ap_capable_freqs(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// Channel numbers from `iw phy` output, excluding anything marked `no IR`,
+/// Frequencies from `iw phy` output, excluding anything marked `no IR`,
 /// `disabled` or requiring radar detection.
-fn parse_ap_capable_channels(iw_phy: &str) -> Vec<u32> {
+fn parse_ap_capable_freqs(iw_phy: &str) -> Vec<u32> {
     let mut out = Vec::new();
     for line in iw_phy.lines() {
         let t = line.trim();
@@ -1837,11 +1850,15 @@ fn parse_ap_capable_channels(iw_phy: &str) -> Vec<u32> {
         if t.contains("no IR") || t.contains("disabled") || t.contains("radar detection") {
             continue;
         }
-        if let Some(open) = t.find('[')
-            && let Some(close) = t[open..].find(']')
-            && let Ok(ch) = t[open + 1..open + close].trim().parse::<u32>()
+        // "* 2412.0 MHz [1] (20.0 dBm)" -> 2412
+        if let Some(mhz) = t
+            .trim_start_matches('*')
+            .split_whitespace()
+            .next()
+            .and_then(|f| f.split('.').next())
+            .and_then(|f| f.parse::<u32>().ok())
         {
-            out.push(ch);
+            out.push(mhz);
         }
     }
     out
@@ -1855,25 +1872,27 @@ fn parse_ap_capable_channels(iw_phy: &str) -> Vec<u32> {
 /// only, forgotten when NetworkManager restarts, so the saved profile is left
 /// alone.
 fn pin_to_ap_capable_band(iface: &str, ssid: &str) -> bool {
-    let capable = ap_capable_channels();
+    let capable = ap_capable_freqs();
     if capable.is_empty() {
+        debug!("could not read which frequencies may host an AP; leaving the link alone");
         return false;
     }
-    match station_channel(iface) {
-        Some(ch) if capable.contains(&ch) => return true, // already fine
-        _ => {}
+    if let Some(freq) = station_freq(iface)
+        && capable.contains(&freq)
+    {
+        return true; // already somewhere we can beacon
     }
-    // 2.4GHz is where the usable channels almost always are when 5GHz is no-IR.
-    if !capable.iter().any(|c| *c <= 14) {
-        warn!("no channel on this radio may host an AP; the hotspot cannot start");
+    // 2.4GHz is where the usable frequencies almost always are when 5GHz is no-IR.
+    if !capable.iter().any(|f| *f < 2500) {
+        warn!("no frequency on this radio may host an AP; the hotspot cannot start");
         return false;
     }
 
     warn!(
-        "the Wi-Fi is on a channel this adapter may not transmit on, so a hotspot \
+        "the Wi-Fi is on a frequency this adapter may not transmit on, so a hotspot \
          cannot run alongside it — switching the connection to 2.4GHz. This trades \
-         the link's 5GHz speed for the hotspot; the change is temporary and is \
-         forgotten when NetworkManager restarts"
+         the link's speed for the hotspot; the change is temporary and is forgotten \
+         when NetworkManager restarts"
     );
     let modified = Command::new("nmcli")
         .args([
@@ -1898,23 +1917,23 @@ fn pin_to_ap_capable_band(iface: &str, ssid: &str) -> bool {
         .args(["connection", "up", ssid])
         .output();
 
-    // Wait for it to land somewhere we can actually beacon.
     for _ in 0..20 {
         std::thread::sleep(Duration::from_millis(500));
         if shutdown_requested() {
             return false;
         }
-        if let Some(ch) = station_channel(iface)
-            && capable.contains(&ch)
+        if let Some(freq) = station_freq(iface)
+            && capable.contains(&freq)
         {
             info!(
-                channel = ch,
-                "reconnected on a channel that can host the hotspot"
+                freq,
+                channel = channel_for_freq(freq).unwrap_or(0),
+                "reconnected on a frequency that can host the hotspot"
             );
             return true;
         }
     }
-    warn!("the connection did not come back on a channel that can host an AP");
+    warn!("the connection did not come back on a frequency that can host an AP");
     false
 }
 
@@ -2374,26 +2393,31 @@ mod tests {
         assert_eq!(poll_cadence(user_fast, Duration::ZERO, false), user_fast);
     }
 
-    /// Real `iw phy` output from the laptop: every 5GHz channel is `no IR`, so
-    /// only 2.4GHz can host an AP. This is what made `--hotspot` fail while the
-    /// station was on 5GHz — the card can associate there but never beacon.
+    /// Real `iw phy` output from a Wi-Fi 6E laptop. Every 5GHz frequency is
+    /// `no IR`, so only 2.4GHz can host an AP — but channel *numbers* repeat
+    /// across bands: 161 is both 5805 MHz (unusable) and 6755 MHz (usable).
+    /// Matching on channel number made an unusable station look fine, and the
+    /// band check silently did nothing.
     #[test]
-    fn ap_capable_channels_exclude_no_ir() {
+    fn ap_capable_freqs_exclude_no_ir_and_do_not_confuse_bands() {
         let iw = "\t\t\t* 2412.0 MHz [1] (20.0 dBm)\n\
                   \t\t\t* 2437.0 MHz [6] (20.0 dBm)\n\
-                  \t\t\t* 2462.0 MHz [11] (20.0 dBm)\n\
                   \t\t\t* 5180.0 MHz [36] (20.0 dBm) (no IR)\n\
                   \t\t\t* 5805.0 MHz [161] (20.0 dBm) (no IR)\n\
+                  \t\t\t* 6755.0 MHz [161] (30.0 dBm)\n\
                   \t\t\t* 5260.0 MHz [52] (20.0 dBm) (radar detection)\n\
                   \t\t\t* 5320.0 MHz [64] (disabled)\n";
-        let ch = parse_ap_capable_channels(iw);
-        assert_eq!(ch, vec![1, 6, 11]);
-        assert!(!ch.contains(&161), "no-IR channels cannot host an AP");
+        let f = parse_ap_capable_freqs(iw);
+        assert_eq!(f, vec![2412, 2437, 6755]);
+        // The station's 5805 must NOT be considered capable just because a
+        // different band also numbers a channel 161.
+        assert!(!f.contains(&5805), "5GHz ch161 is no IR");
         assert!(
-            !ch.contains(&52),
-            "radar channels need DFS, not usable here"
+            f.contains(&6755),
+            "6GHz ch161 is fine, and is a different freq"
         );
-        assert!(!ch.contains(&64));
+        assert!(!f.contains(&5260), "radar channels need DFS");
+        assert!(!f.contains(&5320));
     }
 
     #[test]
