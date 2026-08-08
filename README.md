@@ -172,10 +172,16 @@ is.
 sirensong --hotspot
 ```
 
-That is the whole command. The network is named `<hostname>-sirensong`, and on
-first run a 20-character passphrase is generated and saved to
-`~/.config/sirensong/hotspot.pass` (mode `0600`). Credentials print with a QR
-code — point your phone's camera at it to join, no typing:
+That is the whole command. The hotspot lands on **whatever channel your Wi-Fi is
+already using** — most cards will only host an AP on a second channel in a
+restricted mode that often fails outright, so following the station is both the
+reliable choice and one less thing to look up. `--hotspot-channel` overrides it,
+and warns if you pick one the station is not on.
+
+The network is named `<hostname>-sirensong`, and on first run a 20-character
+passphrase is generated and saved to `~/.config/sirensong/hotspot.pass` (mode
+`0600`). Credentials print with a QR code — point your phone's camera at it to
+join, no typing:
 
 ```
   network:  hostname-sirensong

@@ -167,7 +167,8 @@ struct Hotspot {
     /// generate and remember a fresh one" — resolved at start rather than parse
     /// time so that argument parsing stays free of side effects.
     pass: Option<String>,
-    channel: u32,
+    /// `None` means follow the station's channel, resolved at start.
+    channel: Option<u32>,
 }
 
 /// Trim an SSID to the 802.11 limit of 32 *bytes*, without splitting a character.
@@ -212,7 +213,7 @@ fn print_help() {
          \x20       --hotspot-ssid <NAME>  Network name (default: <hostname>-sirensong)\n\
          \x20       --hotspot-pass <PASS>  Passphrase (or set SIRENSONG_HOTSPOT_PASS;\n\
          \x20                              otherwise one is generated and remembered)\n\
-         \x20       --hotspot-channel <N>  AP channel (default 1; keep it off the client's band)\n\n\
+         \x20       --hotspot-channel <N>  AP channel (default: same as the Wi-Fi station)\n\n\
          The hotspot is stopped when sirensong exits, so the radio doesn't keep\n\
          draining battery. A generated passphrase is saved to\n\
          ~/.config/sirensong/hotspot.pass so devices only pair once, and the\n\
@@ -235,7 +236,7 @@ fn parse_args_from<I: Iterator<Item = String>>(args: I) -> Result<Config, String
     let mut hotspot = false;
     let mut hotspot_ssid = None;
     let mut hotspot_pass = None;
-    let mut hotspot_channel = 1u32;
+    let mut hotspot_channel: Option<u32> = None;
     let mut args = args.peekable();
 
     while let Some(arg) = args.next() {
@@ -259,9 +260,10 @@ fn parse_args_from<I: Iterator<Item = String>>(args: I) -> Result<Config, String
                 let val = args
                     .next()
                     .ok_or_else(|| "--hotspot-channel requires a number".to_string())?;
-                hotspot_channel = val
-                    .parse()
-                    .map_err(|_| format!("invalid --hotspot-channel value: {val}"))?;
+                hotspot_channel = Some(
+                    val.parse()
+                        .map_err(|_| format!("invalid --hotspot-channel value: {val}"))?,
+                );
             }
             "-h" | "--help" => {
                 print_help();
@@ -1499,6 +1501,42 @@ fn ap_interface() -> Option<String> {
 /// created-but-DISABLED interface behind when hostapd fails to pick an operating
 /// frequency — most often because the regulatory domain forbids beaconing on the
 /// chosen channel (`iw reg get` showing `country 00` is the usual culprit).
+/// Wi-Fi channel for a frequency in MHz, per the 2.4GHz and 5GHz numbering.
+fn channel_for_freq(mhz: u32) -> Option<u32> {
+    match mhz {
+        2484 => Some(14),
+        2412..=2472 => Some((mhz - 2407) / 5),
+        5000..=5895 => Some((mhz - 5000) / 5),
+        _ => None,
+    }
+}
+
+/// The channel the Wi-Fi station is currently associated on.
+///
+/// The hotspot defaults to this rather than a fixed channel. Cards commonly
+/// advertise two interface combinations — a permissive one capped at a single
+/// channel, and a narrow one allowing two — so putting the AP anywhere other
+/// than the station's channel quietly demands the narrow combination and often
+/// just fails. Asking the user to look up their channel and pass it is the tool
+/// refusing to read something it can see.
+fn station_channel(dev: &str) -> Option<u32> {
+    let out = Command::new("iw")
+        .args(["dev", dev, "link"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_link_freq(&String::from_utf8_lossy(&out.stdout)).and_then(channel_for_freq)
+}
+
+/// `\tfreq: 5805.0` -> `5805`.
+fn parse_link_freq(link: &str) -> Option<u32> {
+    let line = link.lines().find(|l| l.trim_start().starts_with("freq:"))?;
+    let raw = line.split(':').nth(1)?.trim();
+    raw.split('.').next()?.trim().parse().ok()
+}
+
 /// Is this interface actually carrying traffic?
 ///
 /// Reads `operstate` rather than scanning `ip -br link show` for "UP", which was
@@ -1779,9 +1817,28 @@ fn hotspot_start(hs: &Hotspot) -> Option<HotspotGuard> {
     let iface = wifi_device()?;
     let pass = resolve_passphrase(hs.pass.as_ref())?;
     warn_if_regdom_blocks_ap();
+
+    // Follow the station unless told otherwise: an AP on a different channel
+    // needs the card's narrow interface combination and frequently just fails.
+    let station = station_channel(&iface);
+    let channel = match hs.channel {
+        Some(c) => c,
+        None => station.unwrap_or(1),
+    };
+    if let (Some(explicit), Some(sta)) = (hs.channel, station)
+        && explicit != sta
+    {
+        warn!(
+            requested = explicit,
+            station = sta,
+            "the hotspot channel differs from the one the Wi-Fi station is on; \
+             most cards only allow that in a restricted mode and it often fails \
+             to start — omit --hotspot-channel to follow the station"
+        );
+    }
     info!(
         ssid = %hs.ssid,
-        channel = hs.channel,
+        channel,
         "starting hotspot on {}", iface
     );
 
@@ -1790,7 +1847,7 @@ fn hotspot_start(hs: &Hotspot) -> Option<HotspotGuard> {
             "create_ap",
             "--daemon",
             "-c",
-            &hs.channel.to_string(),
+            &channel.to_string(),
             // See the note in `restart` — create_ap's getopt permutes, so the
             // positionals must be fenced off from option parsing.
             "--",
@@ -1813,7 +1870,7 @@ fn hotspot_start(hs: &Hotspot) -> Option<HotspotGuard> {
         ap_iface: String::new(),
         ssid: hs.ssid.clone(),
         pass: pass.clone(),
-        channel: hs.channel,
+        channel,
     };
     // Reachable from the signal handler, which cannot run destructors.
     let _ = HOTSPOT_IFACE.set(iface.clone());
@@ -1835,11 +1892,22 @@ fn hotspot_start(hs: &Hotspot) -> Option<HotspotGuard> {
         }
     }
 
-    error!(
-        "hotspot interface never came up. Most often the regulatory domain forbids \
-         beaconing — check `iw reg get`; if it says `country 00`, set your country \
-         (e.g. `sudo iw reg set PH`) and retry"
-    );
+    // Name the cause that actually applies. Blaming the regulatory domain
+    // unconditionally sent a user hunting through `iw reg get` while their
+    // domain was set correctly and the real problem was a channel the card
+    // would not host alongside the station.
+    match (station, hs.channel) {
+        (Some(sta), Some(explicit)) if explicit != sta => error!(
+            "hotspot interface never came up. The station is on channel {sta} but the \
+             hotspot was asked for {explicit}; most cards will not host an AP on a \
+             second channel. Drop --hotspot-channel to follow the station"
+        ),
+        _ => error!(
+            "hotspot interface never came up. Most often the regulatory domain forbids \
+             beaconing — check `iw reg get`; if it says `country 00`, set your country \
+             (e.g. `sudo iw reg set PH`) and retry"
+        ),
+    }
     None // guard drops here, cleaning up the half-started AP
 }
 
@@ -2198,6 +2266,27 @@ mod tests {
     }
 
     #[test]
+    fn maps_frequencies_to_channels() {
+        // The station this was written against.
+        assert_eq!(channel_for_freq(5805), Some(161));
+        assert_eq!(channel_for_freq(2412), Some(1));
+        assert_eq!(channel_for_freq(2437), Some(6));
+        assert_eq!(channel_for_freq(2462), Some(11));
+        assert_eq!(channel_for_freq(2484), Some(14)); // the odd one out
+        assert_eq!(channel_for_freq(5180), Some(36));
+        assert_eq!(channel_for_freq(1000), None);
+    }
+
+    #[test]
+    fn reads_freq_from_iw_link() {
+        // Real `iw dev wlp2s0 link` output, including the trailing `.0`.
+        let link = "Connected to e4:55:a8:b3:63:8d (on wlp2s0)\n\tSSID: Starbucks Customer\n\tfreq: 5805.0\n\tsignal: -61 dBm\n";
+        assert_eq!(parse_link_freq(link), Some(5805));
+        assert_eq!(parse_link_freq("Not connected.\n"), None);
+        assert_eq!(parse_link_freq(""), None);
+    }
+
+    #[test]
     fn parses_the_default_route_device() {
         // Real output from the router while repeating.
         let r = "default via 192.168.23.254 dev sta1 proto static src 192.168.23.120 metric 20\n";
@@ -2278,7 +2367,8 @@ mod tests {
         let hs = cfg.hotspot.expect("hotspot configured");
         assert_eq!(hs.ssid, default_hotspot_ssid());
         assert!(hs.ssid.ends_with("sirensong"), "got: {}", hs.ssid);
-        assert_eq!(hs.channel, 1);
+        // None means "follow the station", resolved at start rather than parse.
+        assert_eq!(hs.channel, None);
         // Deliberately not asserting `pass.is_none()`: parsing reads
         // SIRENSONG_HOTSPOT_PASS, so that assertion failed for anyone who had it
         // exported — a test that depends on the developer's shell. What actually
