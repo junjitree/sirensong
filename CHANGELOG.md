@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-08-08
+
 ### Fixed
 
 - **Re-auth no longer rotates first.** The portal is now tried on the MAC we
@@ -62,6 +64,27 @@ and this project adheres to
 - **Ctrl-C during a rotation was ignored.** Signals were only observed between
   watch ticks, and a rotation blocks for as long as association takes. A second
   signal now always exits, and stops the hotspot on the way out.
+
+- **The hotspot picks a frequency the radio can actually transmit on.** It
+  defaulted to channel 1 regardless of where the Wi-Fi station was. Cards
+  advertise two interface combinations — a permissive one capped at a single
+  channel, and a narrow one allowing two — so an AP on a different channel from
+  the station quietly demanded the narrow one and failed to start. The channel
+  is now taken from the station unless `--hotspot-channel` says otherwise.
+- **`--hotspot` moves the link to 2.4GHz when the current frequency cannot host
+  an AP.** Under some regulatory domains every 5GHz frequency is flagged
+  `no IR`: the card may associate there as a client but never initiate
+  radiation. A laptop on 5GHz then cannot host a hotspot at all — not on 5GHz,
+  and not on 2.4GHz either, since that needs the restricted combination. The
+  switch is `--temporary`, warns that it is trading link speed for the hotspot,
+  and only ever happens for `--hotspot`.
+- **AP capability is decided by frequency, not channel number.** Channel numbers
+  repeat across bands: on a Wi-Fi 6E card, 161 is both 5805 MHz (`no IR`) and
+  6755 MHz (usable). Matching on the number made an unusable station channel
+  look fine, so the check above silently did nothing.
+- **Hotspot failures name the cause that applies.** The error blamed the
+  regulatory domain unconditionally, which sent a user auditing `iw reg get`
+  while their domain was set correctly and the real problem was the frequency.
 
 ### Changed
 
@@ -238,7 +261,8 @@ Initial release.
 - The Python implementation and the bundled systemd unit (watch mode covers the
   latter).
 
-[unreleased]: https://github.com/junjitree/sirensong/compare/v0.1.4...main
+[unreleased]: https://github.com/junjitree/sirensong/compare/v0.1.5...main
+[0.1.5]: https://github.com/junjitree/sirensong/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/junjitree/sirensong/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/junjitree/sirensong/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/junjitree/sirensong/compare/v0.1.1...v0.1.2
