@@ -8,6 +8,86 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **Re-auth no longer rotates first.** The portal is now tried on the MAC we
+  already have, and a rotation only happens if it refuses. Arriving somewhere,
+  the per-device cap has usually reset, so the common case is a form POST rather
+  than a 31s daemon restart plus a spent MAC. Measured against a live portal on
+  a MAC it had never seen: **~1.5s instead of ~35s.**
+- **"Nothing to do here" is no longer counted as a failure.** `reconcile`
+  returns `Online` / `Declined` / `Failed`, and only `Failed` drives the
+  exponential backoff. On the router, a booting repeater reports `Down` on every
+  tick while associating, which used to walk the poll interval to 15 minutes —
+  so the moment the portal became reachable was the moment we had stopped
+  looking.
+- **`authenticity_token` was parsed with `name="…"\s+value="…"`**, but Rails'
+  `hidden_field_tag` puts `id=` between the two. Any splash rendered that way
+  failed forever while reporting that the markup had changed. The `continue_url`
+  pattern already allowed for this; the two disagreed.
+- **The portal POST reported success on any HTTP status** — 401, 500, or a
+  splash re-served saying the free allowance was used up. Rejection was
+  indistinguishable from acceptance.
+- **A relative form action lost its path and query.**
+  `action="/splash/billing_pick?mauth=…"` was discarded and replaced with a
+  synthesised URL, dropping parameters the portal needs.
+- **The connectivity probe could misread a working link.** A single 64-byte read
+  can return a partial status line: `"HTTP"` classified as offline (costing a
+  needless rotation), `"HTTP/1.1 20"` as a portal.
+- **`ap_is_up()` matched interfaces that were down** — `ip -br link show` prints
+  `DOWN … <NO-CARRIER,BROADCAST,MULTICAST,UP>` for a stopped device, and the
+  check looked for `UP` anywhere in that line. Startup declared success on an AP
+  that never began beaconing, printed the QR code, and then the watch loop's
+  stricter `operstate` check disagreed — tearing down and restarting the hotspot
+  every tick, indefinitely. Both checks now share one function. **This affects
+  0.1.4.**
+- **The saved hotspot passphrase was world-readable between creation and
+  `chmod`** (measured `0644`, then `0600`), and an existing `0644` file was
+  never repaired. It is now created `0600`.
+- **Passphrases and SSIDs were not validated against what `create_ap` accepts.**
+  It enforces 8–63 and 1–32 _characters_; sirensong checked `>= 8` _bytes_ with
+  no upper bound, and never checked the saved file at all. An embedded newline
+  reached hostapd's generated config unquoted.
+- **`create_ap` arguments are now fenced with `--`.** It parses with GNU
+  `getopt`, which permutes, so an SSID or passphrase beginning with `-` was read
+  as a flag.
+- **`sirensong Starbucks Customer`** (missing quotes) silently watched a network
+  called `Customer`. Extra positional arguments are now an error that names the
+  fix.
+- **Non-UTF-8 arguments panicked.** SSIDs are byte strings; a latin-1 café name
+  crashed with a backtrace instead of an error.
+- **`portal_host` and `http_login` used different redirect policies** for the
+  same URL, so they could disagree about where a chain ended — enough to make
+  sirensong decline its own portal.
+- **Ctrl-C during a rotation was ignored.** Signals were only observed between
+  watch ticks, and a rotation blocks for as long as association takes. A second
+  signal now always exits, and stops the hotspot on the way out.
+
+### Changed
+
+- **Default watch interval 60s → 30s**, and 5s until the first successful
+  sign-in of a run. Time-to-notice was the largest single component of downtime
+  — larger than the sign-in itself.
+- **Rotation waits on evidence, not a clock.** The 10-minute cap was actively
+  harmful: giving up does not cancel anything, and reporting failure let the
+  watch loop rotate again and restart a nearly-complete association. Give-up is
+  now a stall detector over the daemon state, live MAC and default route.
+- **Rotation only happens on the configured network**, and only when the Wi-Fi
+  station is actually carrying traffic — on ethernet or a tether it declines
+  rather than restarting the repeater daemon for nothing.
+- **A recognised portal with no free-plan form is `Declined`, not `Failed`.** A
+  fresh MAC lands on the same unusable page, so rotating cannot help.
+
+### Added
+
+- **`router/`** — procd service, UCI config, hardware-slider handler and setup
+  notes for running on a GL.iNet travel router. The **GL.iNet backend is now
+  validated end-to-end against a live Meraki portal**, including unattended cold
+  boot: ~30s from power-on to authenticated, on a MAC the portal had never seen.
+  Tested on one device (Slate 7 / GL-BE3600, firmware 4.9.0) at one venue.
+- README now documents the router backend, which was shipped in 0.1.3 and
+  mentioned only in this changelog.
+
 ## [0.1.4] - 2026-08-07
 
 ### Changed
@@ -59,9 +139,9 @@ for anything but the docs.
   it recreates the station vdev — roughly 30s, and without the device reboot
   GL.iNet's own `ubus repeater connect` performs. Waiting is driven by the
   daemon's reported state rather than a fixed duration, because a reconnect
-  takes ~30s on a quiet network and minutes on a busy one. **Not yet validated
-  end-to-end against a live portal**; the NetworkManager path is untouched and
-  unaffected.
+  takes ~30s on a quiet network and minutes on a busy one. (Not validated
+  end-to-end at the time of this release — that landed later; see Unreleased.
+  The NetworkManager path is untouched and unaffected.)
 
 ## [0.1.2] - 2026-07-30
 

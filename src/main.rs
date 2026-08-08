@@ -1,10 +1,75 @@
 use std::env;
 use std::process::Command;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
+
+/// Set once SIGTERM or Ctrl-C arrives.
+///
+/// Signals used to be observed only in `sleep_or_shutdown`, i.e. in the gaps
+/// *between* watch ticks — nothing was listening during a reconcile. That is
+/// fine when reconciles are quick, but a repeater rotation blocks for as long as
+/// the association takes, which on a congested network is minutes. Ctrl-C was
+/// ignored for the whole of it, and because tokio installs a handler the default
+/// "Ctrl-C kills the process" behaviour is gone, so it looked hung. The blocking
+/// loops poll this flag so they can abandon what they are doing instead.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// The Wi-Fi interface a hotspot was started on, if any.
+///
+/// The `HotspotGuard` `Drop` impl is what normally stops `create_ap`, but the
+/// force-exit below calls `process::exit`, which runs no destructors — so the
+/// escape hatch for an unresponsive first Ctrl-C would otherwise leave the radio
+/// beaconing, which is the exact battery drain the guard exists to prevent. One
+/// fix cancelling the other.
+static HOTSPOT_IFACE: OnceLock<String> = OnceLock::new();
+
+fn shutdown_requested() -> bool {
+    SHUTDOWN.load(Ordering::Relaxed)
+}
+
+/// Watch for termination signals for the whole life of the process, so a signal
+/// is recorded the moment it arrives rather than whenever we next happen to be
+/// sitting in an await.
+fn spawn_shutdown_listener() {
+    tokio::spawn(async {
+        let mut sigterm = signal(SignalKind::terminate()).ok();
+        loop {
+            match sigterm.as_mut() {
+                Some(sig) => {
+                    tokio::select! {
+                        _ = sig.recv() => {}
+                        _ = tokio::signal::ctrl_c() => {}
+                    }
+                }
+                None => {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+            }
+            // Keep listening rather than returning after the first signal.
+            // Installing a handler removes the kernel's default "Ctrl-C kills
+            // it" disposition process-wide, so if we stopped here a second
+            // Ctrl-C would do nothing at all and the only way out would be
+            // SIGKILL. Any blocking stretch that does not poll the flag —
+            // `nmcli connection up`, a `create_ap` start — would be
+            // uninterruptible. The second signal restores the escape.
+            if SHUTDOWN.swap(true, Ordering::Relaxed) {
+                eprintln!("sirensong: second signal received — exiting immediately");
+                if let Some(iface) = HOTSPOT_IFACE.get() {
+                    eprintln!("sirensong: stopping the hotspot on {iface}");
+                    let _ = Command::new("sudo")
+                        .args(["create_ap", "--stop", iface])
+                        .status();
+                }
+                std::process::exit(130);
+            }
+        }
+    });
+}
 
 const DEFAULT_SSID: &str = "Starbucks Customer";
 const CONNECTIVITY_HOST: &str = "connectivitycheck.gstatic.com";
@@ -18,20 +83,64 @@ const CAPTIVE_DETECT_URL: &str = "http://connectivitycheck.gstatic.com/generate_
 const BROWSER_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 /// Upper bound on watch-mode backoff between failed reconcile attempts.
 const MAX_BACKOFF: Duration = Duration::from_secs(900);
+/// Poll interval before the first successful sign-in of a run.
+///
+/// The dominant use case is powering the travel router on while already sitting
+/// in the cafe: it boots, the repeater daemon associates, and the portal starts
+/// intercepting — and until we notice, nothing works. At the normal cadence that
+/// wait is most of the downtime, far more than the sign-in itself. So poll hard
+/// until we get online once, then relax.
+const STARTUP_POLL: Duration = Duration::from_secs(5);
+/// Cap on the fast phase, so a router that never gets online (wrong venue, out
+/// of range) does not probe every 5s indefinitely. Only reached when signing in
+/// never succeeds; the normal exit from the fast phase is success, not the clock.
+const STARTUP_WINDOW: Duration = Duration::from_secs(180);
 /// Registrable domain of the Cisco Meraki splash portals we can log into (hosts
 /// look like `n143.network-auth.com`). This is how we recognize *our* portal
 /// without ever asking which network we are on.
 const PORTAL_HOST: &str = "network-auth.com";
-/// Poll interval while waiting for a rotated repeater to come back.
-const ROTATE_POLL: Duration = Duration::from_secs(2);
-/// Give up after this many polls with no observable progress — no change in the
-/// daemon's state and no change in the live MAC. This is a *stall* detector, not
-/// a duration budget: how long a reconnect takes varies by minutes between a
-/// quiet network and a busy café, so we wait on evidence rather than a guess.
-const ROTATE_STALL_POLLS: u32 = 30;
+/// Poll interval while waiting for a rotated repeater to come back. Success is
+/// noticed on average half an interval late, so this is pure added latency on
+/// every rotation; 1s halves that for one extra `ubus`/`ip` call per second,
+/// which is nothing next to a ~31s rotation.
+const ROTATE_POLL: Duration = Duration::from_secs(1);
+/// Pause between stopping and restarting `create_ap`, giving the old hostapd and
+/// dnsmasq time to release the interface. Unrelated to `ROTATE_POLL`, which it
+/// used to borrow — tuning the poll rate should not change teardown behaviour.
+const AP_RESTART_SETTLE: Duration = Duration::from_secs(2);
+/// Give up after this long with *nothing* moving — no change in the daemon's
+/// state, the live MAC, or the default route. A stall detector, not a duration
+/// budget: a reconnect takes 30s on a quiet network and minutes on a busy café,
+/// so we wait on evidence rather than guessing how long is reasonable.
+///
+/// Generous on purpose. A working rotation moves one of the three within ~30s
+/// (MAC at 18s, association at 26s, lease at 30s), and a daemon cycling between
+/// `connecting` and `failed` is itself movement — so five minutes frozen is not
+/// a slow network, it is stuck. Erring long matters more than erring short:
+/// giving up does not cancel the daemon's own reconnect, it only stops us
+/// watching one that may be about to succeed.
+const ROTATE_STALL_AFTER: Duration = Duration::from_secs(300);
 /// Absolute backstop so a wedged daemon can't block the watch loop forever.
 /// Should never be reached; the stall detector is the real mechanism.
-const ROTATE_MAX_POLLS: u32 = 300;
+///
+/// This was 10 minutes and that was actively harmful. Giving up does not cancel
+/// anything — `gl-repeater` keeps trying in the background — so a cap that
+/// expires mid-association only stops us *watching* a rotation that then
+/// succeeds without us. Observed on a congested café network: the cap fired at
+/// 10:20, and the rotated MAC associated and reached the portal around 22
+/// minutes in. Worse, reporting failure hands control back to the watch loop,
+/// which can rotate again and restart a nearly-complete association from zero.
+/// So the bound is now well past any association we have measured, and exists
+/// only to stop an infinite block.
+const ROTATE_GIVE_UP_AFTER: Duration = Duration::from_secs(3600);
+
+/// Both limits above are wall-clock, derived from whatever `ROTATE_POLL` happens
+/// to be. They used to be counts of polls, which meant changing the poll rate
+/// silently rescaled every timeout with it — halving the interval would have
+/// quietly turned the 60-minute backstop into 30.
+fn polls_for(d: Duration) -> u32 {
+    (d.as_millis() / ROTATE_POLL.as_millis().max(1)).max(1) as u32
+}
 /// How long to wait for the hotspot to actually start beaconing.
 const AP_START_POLL: Duration = Duration::from_secs(1);
 const AP_START_POLLS: u32 = 25;
@@ -94,7 +203,7 @@ fn print_help() {
          ARGS:\n    <SSID>    Wi-Fi network name (default: \"{DEFAULT_SSID}\")\n\n\
          OPTIONS:\n\
          \x20   -o, --once             Authenticate once and exit (default: watch and re-auth on drop)\n\
-         \x20   -i, --interval <SECS>  Watch poll interval in seconds (default: 60)\n\
+         \x20   -i, --interval <SECS>  Watch poll interval in seconds (default: 30)\n\
          \x20   -q, --quiet            Only log errors (overrides RUST_LOG)\n\
          \x20   -h, --help             Print this help\n\
          \x20   -V, --version          Print version\n\n\
@@ -108,8 +217,8 @@ fn print_help() {
          draining battery. A generated passphrase is saved to\n\
          ~/.config/sirensong/hotspot.pass so devices only pair once, and the\n\
          credentials print as a QR code you can scan to join.\n\
-         Prefer SIRENSONG_HOTSPOT_PASS over --hotspot-pass: arguments are\n\
-         visible to other users via ps.\n\n\
+         Note that either way the passphrase reaches create_ap as an argument,\n\
+         so it is visible to other local users via ps for as long as the AP runs.\n\n\
          Log verbosity is otherwise controlled by RUST_LOG (e.g. RUST_LOG=debug)."
     );
 }
@@ -117,7 +226,11 @@ fn print_help() {
 fn parse_args_from<I: Iterator<Item = String>>(args: I) -> Result<Config, String> {
     let mut ssid = None;
     let mut once = false;
-    let mut interval = Duration::from_secs(60);
+    // How long a drop can go unnoticed, so it lands directly in the user's
+    // downtime: worst case is a full interval plus the ~2s `confirmed_offline`
+    // takes, and only then does the ~34s reauth start. At 60s this dominated
+    // everything else — the wait to notice cost more than the rotation itself.
+    let mut interval = Duration::from_secs(30);
     let mut quiet = false;
     let mut hotspot = false;
     let mut hotspot_ssid = None;
@@ -173,6 +286,15 @@ fn parse_args_from<I: Iterator<Item = String>>(args: I) -> Result<Config, String
             other if other.starts_with('-') => {
                 return Err(format!("unknown option: {other}"));
             }
+            // Last-wins silently swallowed the common `sirensong Starbucks
+            // Customer` (missing quotes), which then watched a network called
+            // "Customer" and never explained why nothing worked.
+            other if ssid.is_some() => {
+                return Err(format!(
+                    "unexpected extra argument: {other}. An SSID with spaces needs quoting, \
+                     e.g. sirensong \"Starbucks Customer\""
+                ));
+            }
             other => ssid = Some(other.to_string()),
         }
     }
@@ -181,16 +303,29 @@ fn parse_args_from<I: Iterator<Item = String>>(args: I) -> Result<Config, String
         return Err("--hotspot-ssid does nothing without --hotspot".to_string());
     }
 
-    // Env var is preferred over the flag: argv is world-readable via ps.
+    // Both sources end up in create_ap's argv, so neither hides the passphrase
+    // from `ps`. The env var only keeps it out of *our* command line and the
+    // shell history — worth having, but not the protection it was described as.
     let hotspot = if !hotspot {
         None
     } else {
         let pass = hotspot_pass.or_else(|| env::var("SIRENSONG_HOTSPOT_PASS").ok());
-        if pass.as_deref().is_some_and(|p| p.len() < 8) {
-            return Err("hotspot passphrase must be at least 8 characters (WPA2)".to_string());
+        if pass.as_deref().is_some_and(|p| !valid_passphrase(p)) {
+            return Err(
+                "hotspot passphrase must be 8-63 characters with no newlines (WPA2)".to_string(),
+            );
+        }
+        // Same limits create_ap enforces, checked here so the error names the
+        // real problem instead of surfacing as a failed launch.
+        let ssid = hotspot_ssid.unwrap_or_else(default_hotspot_ssid);
+        let ssid_chars = ssid.chars().count();
+        if !(1..=32).contains(&ssid_chars) {
+            return Err(format!(
+                "hotspot SSID must be 1-32 characters (got {ssid_chars})"
+            ));
         }
         Some(Hotspot {
-            ssid: hotspot_ssid.unwrap_or_else(default_hotspot_ssid),
+            ssid,
             pass,
             channel: hotspot_channel,
         })
@@ -282,11 +417,30 @@ fn probe_blocking() -> Reach {
         return Reach::Down;
     }
 
+    // Keep reading until we have the whole status line. `read` may return any
+    // number of bytes, and a single call could hand back just `"HTTP"` or
+    // `"HTTP/1.1 20"` — the first classifies as `Down` (a false offline, which
+    // costs a needless rotation) and the second as `Intercepted` (a false
+    // portal). Both are indistinguishable from the real thing downstream.
     let mut buf = [0u8; 64];
-    match stream.read(&mut buf) {
-        Ok(0) | Err(_) => Reach::Down,
-        Ok(n) => classify_response(&String::from_utf8_lossy(&buf[..n])),
+    let mut have = 0usize;
+    loop {
+        match stream.read(&mut buf[have..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                have += n;
+                // Enough for "HTTP/1.1 204", or a full line if it is shorter.
+                if have >= 12 || buf[..have].contains(&b'\n') || have == buf.len() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
     }
+    if have == 0 {
+        return Reach::Down;
+    }
+    classify_response(&String::from_utf8_lossy(&buf[..have]))
 }
 
 async fn probe() -> Reach {
@@ -551,12 +705,69 @@ fn repeater_status() -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// The SSID we are actually associated to, or `None` if we are not.
+///
+/// The `ssid` in this payload is nested under `config` — it is the network the
+/// repeater is *configured* to join, and `ubus` reports it whether or not we
+/// ever associated. Returning it unconditionally made `current_ssid()` claim we
+/// were attached to something while the radio was disassociated, which is the
+/// opposite of what its callers ask it. Gate it on the daemon's own state so it
+/// means the same thing the NetworkManager side does.
 fn repeater_ssid() -> Option<String> {
-    parse_repeater_ssid(&repeater_status()?)
+    let status = repeater_status()?;
+    if parse_repeater_state(&status).as_deref() != Some("connected") {
+        return None;
+    }
+    parse_repeater_ssid(&status)
 }
 
 fn repeater_state() -> Option<String> {
     parse_repeater_state(&repeater_status()?)
+}
+
+/// Device the default route currently goes out of, from `ip route show default`.
+fn default_route_device() -> Option<String> {
+    let out = Command::new("ip")
+        .args(["route", "show", "default"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_default_route_device(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// `default via 192.168.23.254 dev sta1 proto static ...` -> `sta1`.
+fn parse_default_route_device(routes: &str) -> Option<String> {
+    let line = routes.lines().next()?;
+    let mut it = line.split_whitespace();
+    while let Some(tok) = it.next() {
+        if tok == "dev" {
+            return it.next().map(str::to_string);
+        }
+    }
+    None
+}
+
+/// Is the Wi-Fi station actually carrying our traffic?
+///
+/// The backend is chosen by `/etc/init.d/repeater` existing, and that ships in
+/// every GL.iNet mode — the device reports `mode='router'` even while repeating.
+/// So being on this backend says nothing about where the uplink is. Rotating the
+/// station MAC when traffic goes out over ethernet or a tether restarts
+/// `gl-repeater` for nothing, and then waits for a route via the station that
+/// will never appear, burning the full stall budget before failing and retrying.
+///
+/// Checking the route beats detecting the mode: it is what actually matters, and
+/// it stays correct if a cable is plugged in mid-session.
+fn station_is_uplink() -> bool {
+    match (uci_get("wireless.sta.ifname"), default_route_device()) {
+        (Some(sta), Some(dev)) => sta == dev,
+        // No default route yet: mid-reconnect, so assume the station is ours —
+        // that is the normal state during the rotation we are about to do.
+        (Some(_), None) => true,
+        _ => false,
+    }
 }
 
 /// MAC field from a single `ip -br link show <dev>` line, lowercased.
@@ -575,12 +786,34 @@ fn link_mac(dev: &str) -> Option<String> {
     parse_link_mac(&String::from_utf8_lossy(&out.stdout))
 }
 
-fn default_route_present() -> bool {
-    Command::new("ip")
-        .args(["route", "show", "default"])
+/// Does the *station* have a default route yet?
+///
+/// Scoped to the station device on purpose. Matching any default route meant a
+/// second one — a wired WAN into the GL.iNet, or a leftover — satisfied this
+/// from the first poll, so a rotation reported success at ~18s, before the radio
+/// had associated and long before DHCP. Everything downstream then ran against
+/// an unassociated link and failed for reasons that looked like a portal fault.
+/// Takes the device rather than re-reading it: the caller already resolved the
+/// station name this poll, and the name flips between `sta0` and `sta1` across a
+/// restart. Two independent reads could straddle that flip and match the new
+/// interface's MAC against the *old* interface's route — reintroducing the early
+/// false success the scoping exists to prevent.
+fn default_route_present(dev: &str) -> bool {
+    match Command::new("ip")
+        .args(["route", "show", "default", "dev", dev])
         .output()
-        .map(|o| !o.stdout.is_empty())
-        .unwrap_or(false)
+    {
+        // A missing device exits non-zero with empty stdout, which is otherwise
+        // indistinguishable from "associated but not routed yet" — and silently
+        // waiting out the backstop on a stale interface name is a long way to
+        // fail for something worth saying out loud.
+        Ok(o) if !o.status.success() => {
+            debug!(dev, "ip route failed; is the station interface name stale?");
+            false
+        }
+        Ok(o) => !o.stdout.is_empty(),
+        Err(_) => false,
+    }
 }
 
 /// Rotate the repeater's MAC and wait for the link to come back on it.
@@ -589,6 +822,14 @@ fn default_route_present() -> bool {
 /// so it recreates the station vdev with the new address. Returns once the
 /// station is up on that MAC with a default route — typically ~30s.
 fn rotate_repeater(cfg: &Config) -> bool {
+    if !station_is_uplink() {
+        warn!(
+            "the Wi-Fi station isn't carrying traffic (uplink is {}), so rotating its \
+             MAC would change nothing — leaving it alone",
+            default_route_device().unwrap_or_else(|| "unknown".into())
+        );
+        return false;
+    }
     let Some(idx) = repeater_index(&cfg.ssid) else {
         error!("no saved network on the router for {}", cfg.ssid);
         return false;
@@ -646,33 +887,76 @@ fn rotate_repeater(cfg: &Config) -> bool {
     let mut last = String::new();
     let mut stalled = 0u32;
 
-    for poll in 0..ROTATE_MAX_POLLS {
+    let stall_polls = polls_for(ROTATE_STALL_AFTER);
+    for poll in 0..polls_for(ROTATE_GIVE_UP_AFTER) {
         std::thread::sleep(ROTATE_POLL);
 
-        let state = repeater_state().unwrap_or_default();
-        let live = uci_get("wireless.sta.ifname")
-            .as_deref()
-            .and_then(link_mac)
-            .unwrap_or_default();
+        // A rotation can legitimately run for many minutes; without this, Ctrl-C
+        // is not acted on until it finishes. The daemon keeps reconnecting on
+        // its own after we let go, which is what we want on the way out anyway.
+        if shutdown_requested() {
+            info!("stopping — leaving the reconnect to the repeater daemon");
+            return false;
+        }
 
-        if live == want && default_route_present() {
+        // Resolve the station name once and use it for both reads. The name
+        // flips sta0<->sta1 across a restart, so reading it twice could match the
+        // new interface's MAC against the old interface's route.
+        let dev = uci_get("wireless.sta.ifname").unwrap_or_default();
+        let state = repeater_state().unwrap_or_default();
+        let live = link_mac(&dev).unwrap_or_default();
+        let route = !dev.is_empty() && default_route_present(&dev);
+
+        // Every poll, because the interesting question is which of these
+        // actually moves while the daemon sits in `connecting` — that is the
+        // phase where stall detection currently cannot tell a slow association
+        // apart from a wedged one.
+        debug!(
+            poll = poll + 1,
+            state = %state,
+            live = %live,
+            want = %want,
+            route,
+            stalled,
+            "rotate poll"
+        );
+
+        if live == want && route {
             debug!(mac = %want, polls = poll + 1, "repeater back up on the rotated MAC");
             return true;
         }
 
-        // `failed` is transient, not terminal: the daemon reports it between
-        // retries and then keeps going, so treating it as fatal aborts a
-        // reconnect that would have succeeded (observed recovering ~8 minutes
-        // later on a congested network). Let the stall detector decide instead —
-        // an oscillation between `connecting` and `failed` is the daemon
-        // working, whereas sitting in one state with nothing moving is not.
-        let seen = format!("{state}|{live}");
-        if state == "connecting" || seen != last {
+        // Give up only on evidence of a stall, never on a clock, and treat the
+        // fingerprint as the sole signal.
+        //
+        // A rotation climbs through stages rather than flipping once. Measured on
+        // a live cafe network: the vdev is destroyed and recreated with the new
+        // MAC at 18s (`live` empty -> ours), associates at 26s (`connecting` ->
+        // `connected`), and gets a lease at 30s (`route`). All three belong in
+        // the fingerprint, because each phase is one where the others are still.
+        //
+        // No state is exempt. Earlier versions suppressed the counter for the
+        // states the daemon reports, which sounded principled and left the
+        // detector unable to fire at all — `state_s` is only ever `idle`,
+        // `connecting`, `connected` or `failed` (the live payload pins the
+        // mapping: `"state": 2` renders `"connected"`), so exempting them all
+        // meant only a silent `ubus` could ever trip it, and the real bound
+        // became ROTATE_GIVE_UP_AFTER an hour later. `idle` in particular is
+        // what a freshly restarted daemon reports while sweeping bands, so it
+        // must not be treated as wedged on its own — but a genuinely stuck
+        // daemon also reports a state, so the state alone decides nothing.
+        //
+        // What actually distinguishes the two is whether *anything* moves. Hence
+        // a generous budget: a working rotation changes one of the three within
+        // ~30s, and `failed` oscillating with `connecting` is itself movement, so
+        // a frozen fingerprint for minutes really does mean stuck.
+        let seen = format!("{state}|{live}|{route}");
+        if seen != last {
             stalled = 0;
             last = seen;
         } else {
             stalled += 1;
-            if stalled >= ROTATE_STALL_POLLS {
+            if stalled >= stall_polls {
                 warn!(state = %state, mac = %live, "repeater stopped making progress");
                 return false;
             }
@@ -796,6 +1080,8 @@ async fn portal_host(detect_url: &str) -> Option<String> {
         .cookie_store(true)
         .user_agent(BROWSER_UA)
         .timeout(Duration::from_secs(15))
+        // Same policy `http_login` uses, so both agree on where a chain ends.
+        .redirect(portal_redirect_policy())
         .build()
         .ok()?;
     let resp = client.get(detect_url).send().await.ok()?;
@@ -836,6 +1122,44 @@ fn billing_pick_form(html: &str) -> Option<&str> {
     let end = html[start..].find("</form>").map(|e| start + e)?;
     Some(&html[start..end])
 }
+/// Follow redirects only while they stay on the portal.
+///
+/// The chain's last hop is a bounce to the venue's own website (`continue_url`,
+/// e.g. starbucks.ph) — pure navigation for a human's browser, measured at 2.3s
+/// of a 4s login spent loading a marketing page we discard. Everything before it
+/// is followed, so any confirmation hop Meraki needs still happens.
+///
+/// Shared by both clients that fetch the captive-detect URL. They used to differ:
+/// `portal_host` took reqwest's default policy and followed the bounce out, so
+/// on any chain ending off-portal it would report `www.starbucks.ph`,
+/// `is_known_portal` would reject it, and reconcile would decline to act on our
+/// own portal — while `http_login` saw a different final host for the same URL.
+fn portal_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        // `error`, not `stop`: `stop` hands the 30x back as a normal response, so
+        // a redirect loop would surface as a *successful* POST at the call site.
+        // reqwest's default errors here, and losing that made a runaway chain
+        // look like a successful login.
+        if attempt.previous().len() >= 10 {
+            return attempt.error("too many redirects");
+        }
+        let on_portal = |u: Option<&str>| u.map(is_known_portal).unwrap_or(false);
+        // Stop only on the hop that *leaves* a portal: the detect URL's redirect
+        // onto the splash is followed (we aren't on a portal yet), as is every
+        // hop within it.
+        let leaving_portal = attempt
+            .previous()
+            .last()
+            .map(|u| on_portal(u.host_str()))
+            .unwrap_or(false)
+            && !on_portal(attempt.url().host_str());
+        if leaving_portal {
+            attempt.stop()
+        } else {
+            attempt.follow()
+        }
+    })
+}
 
 /// HTTP-only captive-portal login (the fast path). Mirrors what the browser
 /// does on the Cisco Meraki splash: GET a captive-detect URL (redirects to the
@@ -845,17 +1169,34 @@ fn billing_pick_form(html: &str) -> Option<&str> {
 /// Returns whether the POST was accepted; the caller confirms real
 /// connectivity. Any parsing/network failure returns `false` (and logs a
 /// `warn!` if the markup looks like it changed, since that needs a code fix).
-async fn http_login(detect_url: &str) -> bool {
+/// Why a sign-in attempt ended the way it did.
+///
+/// `Unusable` matters: a Meraki portal running vouchers, SMS or click-through
+/// terms is recognised by host but has no free-plan form, so there is nothing to
+/// submit. Reporting that as a failure made the caller rotate and try again on a
+/// fresh MAC — which cannot possibly help, and rotated on networks the user
+/// never asked to rotate.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Login {
+    Submitted,
+    /// Recognised portal, but not one we can drive.
+    Unusable,
+    Failed,
+}
+
+async fn http_login(detect_url: &str) -> Login {
+    let redirect_policy = portal_redirect_policy();
     let client = match reqwest::Client::builder()
         .cookie_store(true)
         .user_agent(BROWSER_UA)
         .timeout(Duration::from_secs(15))
+        .redirect(redirect_policy)
         .build()
     {
         Ok(c) => c,
         Err(e) => {
             debug!(error = %e, "could not build HTTP client");
-            return false;
+            return Login::Failed;
         }
     };
 
@@ -864,11 +1205,11 @@ async fn http_login(detect_url: &str) -> bool {
         Ok(r) => r,
         Err(e) => {
             debug!(error = %e, "captive-detect request failed");
-            return false;
+            return Login::Failed;
         }
     };
     if resp.status().as_u16() == 204 {
-        return true; // already online
+        return Login::Submitted; // already online
     }
 
     let final_url = resp.url().clone();
@@ -876,7 +1217,7 @@ async fn http_login(detect_url: &str) -> bool {
         Ok(body) => html_unescape(&body),
         Err(e) => {
             debug!(error = %e, "could not read splash page body");
-            return false;
+            return Login::Failed;
         }
     };
 
@@ -885,27 +1226,42 @@ async fn http_login(detect_url: &str) -> bool {
             "no Meraki free-plan form on this splash page — sirensong only handles the Meraki \
              free-plan portal, so this may be a different vendor (or Meraki markup that changed)"
         );
-        return false;
+        // Not a failure: there is no form to submit, so a fresh MAC changes
+        // nothing. Saying "failed" here made the caller rotate at venues it
+        // fundamentally cannot sign into.
+        return Login::Unusable;
     };
 
-    let Some(token) = capture(form, r#"name="authenticity_token"\s+value="([^"]+)""#) else {
+    // `[^>]*` rather than `\s+`: Rails' `hidden_field_tag` emits
+    // `name="authenticity_token" id="authenticity_token" value="…"`, putting an
+    // attribute between the two. Requiring them adjacent meant a splash rendered
+    // that way failed to parse and reported "markup has likely changed" forever,
+    // on markup that had not meaningfully changed. The `continue_url` pattern
+    // below already allowed for it; the two disagreed for no reason.
+    let Some(token) = capture(form, r#"name="authenticity_token"[^>]*value="([^"]+)""#) else {
         warn!(
             "authenticity_token missing from the free-plan form — the Meraki splash markup \
              has likely changed"
         );
-        return false;
+        return Login::Unusable;
     };
     let continue_url =
         capture(form, r#"name="continue_url"[^>]*value="([^"]*)""#).unwrap_or_default();
-    let post_url = capture(form, r#"action="([^"]*billing_pick[^"]*)""#)
-        .filter(|u| u.starts_with("http"))
-        .unwrap_or_else(|| {
-            format!(
-                "{}://{}/splash/billing_pick",
-                final_url.scheme(),
-                final_url.host_str().unwrap_or("network-auth.com")
-            )
-        });
+    // Resolve a relative action against the splash URL rather than discarding it.
+    // The old `.filter(starts_with("http"))` dropped `/splash/billing_pick?mauth=…`
+    // — a shape Meraki does emit — and rebuilt a bare path, throwing away the
+    // query the portal needs and inventing a host when there wasn't one.
+    let post_url = match capture(form, r#"action="([^"]*billing_pick[^"]*)""#) {
+        Some(action) => final_url
+            .join(&action)
+            .map(|u| u.to_string())
+            .unwrap_or_else(|_| action),
+        None => format!(
+            "{}://{}/splash/billing_pick",
+            final_url.scheme(),
+            final_url.host_str().unwrap_or("network-auth.com")
+        ),
+    };
 
     debug!(url = %post_url, "submitting free-plan portal form");
     let params = [
@@ -915,11 +1271,22 @@ async fn http_login(detect_url: &str) -> bool {
         ("commit", "Continue"),
         ("continue_url", continue_url.as_str()),
     ];
+    // Check the status. `Ok(_) => true` treated 401/404/500 — and a splash
+    // re-served saying the free allowance is used up — as a successful login,
+    // so "the portal rejected us" was indistinguishable from "the portal let us
+    // in", and the only thing catching it was `wait_online` timing out with a
+    // message blaming something else.
     match client.post(&post_url).form(&params).send().await {
-        Ok(_) => true,
+        Ok(resp) if resp.status().is_success() || resp.status().is_redirection() => {
+            Login::Submitted
+        }
+        Ok(resp) => {
+            warn!(status = %resp.status(), url = %post_url, "the portal rejected the sign-in form");
+            Login::Failed
+        }
         Err(e) => {
             debug!(error = %e, "portal POST failed");
-            false
+            Login::Failed
         }
     }
 }
@@ -935,6 +1302,25 @@ async fn wait_online() -> bool {
     false
 }
 
+/// What a reconciliation pass actually did.
+///
+/// `Declined` exists because "this isn't ours to touch" was previously reported
+/// the same way as "we tried and failed", and the watch loop backs off
+/// exponentially on failure. On the router that is the *normal* state for the
+/// whole time the repeater daemon is associating, so a cold boot in a cafe spent
+/// its association window escalating the poll interval — reaching 15 minutes by
+/// the time the portal was finally reachable, which is the one moment we are
+/// needed. Only a real failure should slow us down.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Outcome {
+    /// Online, either already or because we just signed in.
+    Online,
+    /// Deliberately did nothing: not our network, or someone else is mid-repair.
+    Declined,
+    /// Tried and failed.
+    Failed,
+}
+
 /// One reconciliation pass: if already online, do nothing. Otherwise decide
 /// whether this network is ours to act on, and only then reconnect — which
 /// rolls a fresh MAC (see `connect_to_wifi`) so the portal treats us as a new
@@ -943,11 +1329,13 @@ async fn wait_online() -> bool {
 /// The decision is made by asking *who answered*, never by asking which network
 /// we are on. A portal that identifies itself is ours to log into; silence means
 /// the uplink is simply dead and we should keep our hands off.
-async fn reconcile(cfg: &Config) -> bool {
+async fn reconcile(cfg: &Config) -> Outcome {
+    // Signing in is harmless anywhere we recognise the portal; rotating is not.
+    let mut may_rotate = true;
     match probe().await {
         Reach::Online => {
             debug!("already online");
-            return true;
+            return Outcome::Online;
         }
         Reach::Intercepted => {
             // Something answered on our behalf. Touch the connection only if it
@@ -956,56 +1344,129 @@ async fn reconcile(cfg: &Config) -> bool {
             match portal_host(CAPTIVE_DETECT_URL).await {
                 Some(host) if is_known_portal(&host) => {
                     debug!(host, "captive portal recognized");
+                    // Only the configured network is ours to re-identify.
+                    let attached = current_ssid();
+                    if attached.as_deref() != Some(cfg.ssid.as_str()) {
+                        debug!(
+                            attached = attached.as_deref().unwrap_or("?"),
+                            target = %cfg.ssid,
+                            "not the configured network — will sign in but not rotate"
+                        );
+                        may_rotate = false;
+                    }
                 }
                 Some(host) => {
                     debug!(
                         host,
                         "unrecognized captive portal; leaving this network alone"
                     );
-                    return false;
+                    return Outcome::Declined;
                 }
                 None => {
                     debug!("captive portal did not identify itself; leaving this network alone");
-                    return false;
+                    return Outcome::Declined;
                 }
             }
         }
         Reach::Down => {
+            // On the router, associating is the repeater daemon's job, not ours,
+            // and it retries by itself. Rotating here would restart a reconnect
+            // that is already under way and buy nothing — there is no portal
+            // answering to log into, which is the only thing we add. Explicit
+            // rather than relying on the guard below, which used to reach the
+            // same outcome by accident because `repeater_ssid` reported the
+            // configured SSID even while disassociated.
+            if matches!(Backend::detect(), Backend::GlRepeater) {
+                debug!("offline with no portal answering; the repeater daemon owns reconnecting");
+                return Outcome::Declined;
+            }
             // Nothing answered at all. If we are associated to something, its
             // uplink is dead rather than gated — the case where a home outage
             // used to send us hunting for the café AP. Leave it alone.
-            if active_ssid().is_some() {
+            if current_ssid().is_some() {
                 debug!("offline with no portal answering; leaving current network alone");
-                return false;
+                return Outcome::Declined;
             }
             // Associated to nothing, so there is no connection to disrupt. Still
             // skip the join if the target is not even in range.
             if !ssid_in_range(&cfg.ssid) {
                 debug!(ssid = %cfg.ssid, "not associated and target SSID not in range");
-                return false;
+                return Outcome::Declined;
             }
         }
     }
 
+    // Try signing in on the MAC we already have, before spending a rotation.
+    //
+    // Rotating costs ~31s of downtime and burns a MAC against a per-device cap,
+    // and it is only *needed* when the portal refuses us. Arriving at a cafe, or
+    // powering the router on there, the current MAC usually has quota — the cap
+    // resets between visits — so the whole re-auth is a 4s form POST. Ordering it
+    // this way is strictly better: ~4s wasted when the portal does refuse,
+    // ~31s and a MAC saved every time it doesn't.
+    debug!("trying the portal on the current MAC before rotating");
+    match http_login(CAPTIVE_DETECT_URL).await {
+        Login::Submitted if wait_online().await => {
+            debug!(method = "http", "authenticated without rotating");
+            return Outcome::Online;
+        }
+        // Recognised portal we cannot drive (vouchers, SMS, click-through). A
+        // fresh MAC lands on the same unusable form, so stop here rather than
+        // rotating a network the user never asked us to rotate.
+        Login::Unusable => {
+            debug!("this portal has no free-plan form; nothing to do here");
+            return Outcome::Declined;
+        }
+        _ => {}
+    }
+
+    // Rotation is a target-network behaviour. Signing in anywhere we recognise
+    // the portal is welcome — it is read-only — but changing the radio's
+    // identity is not something to do on somebody else's network just because
+    // their portal turned us down.
+    if !may_rotate {
+        debug!(
+            attached = current_ssid().as_deref().unwrap_or("?"),
+            target = %cfg.ssid,
+            "portal refused us, but this isn't the configured network — not rotating"
+        );
+        return Outcome::Declined;
+    }
+
+    // Refused, so the cap has almost certainly been reached on this MAC. Roll a
+    // fresh one and try again — this is the mechanism the whole program exists
+    // for, just no longer the first resort.
+    debug!("portal would not take the current MAC; rotating");
     if !connect_to_wifi(cfg) {
+        if shutdown_requested() {
+            debug!("rotation interrupted");
+            return Outcome::Declined;
+        }
         error!("couldn't join {}", cfg.ssid);
-        return false;
+        return Outcome::Failed;
     }
 
     // A fresh association occasionally restores connectivity on its own
     // (e.g. an open network with no portal); skip auth if so.
     if is_online().await {
         debug!("online after associating");
-        return true;
+        return Outcome::Online;
     }
 
     debug!("authenticating over HTTP");
-    if http_login(CAPTIVE_DETECT_URL).await && wait_online().await {
-        debug!(method = "http", "authenticated");
-        true
-    } else {
-        error!("could not sign in to the Wi-Fi portal");
-        false
+    match http_login(CAPTIVE_DETECT_URL).await {
+        Login::Submitted if wait_online().await => {
+            debug!(method = "http", "authenticated");
+            Outcome::Online
+        }
+        Login::Unusable => {
+            debug!("this portal has no free-plan form; nothing to do here");
+            Outcome::Declined
+        }
+        _ => {
+            error!("could not sign in to the Wi-Fi portal");
+            Outcome::Failed
+        }
     }
 }
 
@@ -1038,15 +1499,25 @@ fn ap_interface() -> Option<String> {
 /// created-but-DISABLED interface behind when hostapd fails to pick an operating
 /// frequency — most often because the regulatory domain forbids beaconing on the
 /// chosen channel (`iw reg get` showing `country 00` is the usual culprit).
-fn ap_is_up() -> bool {
-    let Some(dev) = ap_interface() else {
-        return false;
-    };
-    Command::new("ip")
-        .args(["-br", "link", "show", &dev])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains("UP"))
+/// Is this interface actually carrying traffic?
+///
+/// Reads `operstate` rather than scanning `ip -br link show` for "UP", which was
+/// the old test and matched interfaces that are plainly down: a stopped device
+/// prints `DOWN … <NO-CARRIER,BROADCAST,MULTICAST,UP>`, and `LOWER_UP` matches
+/// too. Startup therefore declared success on an AP that never began beaconing,
+/// while the watch loop's own check used `operstate` and disagreed — so the two
+/// fought, restarting the hotspot on every tick forever.
+fn iface_is_up(dev: &str) -> bool {
+    std::fs::read_to_string(format!("/sys/class/net/{dev}/operstate"))
+        .map(|s| {
+            let s = s.trim();
+            s == "up" || s == "unknown"
+        })
         .unwrap_or(false)
+}
+
+fn ap_is_up() -> bool {
+    ap_interface().map(|dev| iface_is_up(&dev)).unwrap_or(false)
 }
 
 /// Country code from an `iw reg get` dump. `00` is the world domain, under which
@@ -1081,6 +1552,11 @@ fn warn_if_regdom_blocks_ap() {
 /// there draining battery. Covers clean exit, Ctrl-C and panics; nothing can
 /// cover SIGKILL.
 ///
+/// The force-exit on a second signal does *not* run this — `process::exit` skips
+/// destructors — so that path stops the AP itself via `HOTSPOT_IFACE`. Keep the
+/// two in step: an escape hatch that leaks a beaconing radio is worse than the
+/// hang it escapes.
+///
 /// Also carries what's needed to bring the AP back if it dies mid-session —
 /// otherwise sirensong would keep cheerfully watching the portal while the
 /// phone behind it has no network and nothing says so.
@@ -1098,12 +1574,9 @@ impl HotspotGuard {
     /// Cheap liveness check — a single sysfs read, no process spawn and no
     /// output parsing, so it's fine to run on every watch tick.
     fn is_up(&self) -> bool {
-        std::fs::read_to_string(format!("/sys/class/net/{}/operstate", self.ap_iface))
-            .map(|s| {
-                let s = s.trim();
-                s == "up" || s == "unknown"
-            })
-            .unwrap_or(false)
+        // Same test `ap_is_up` uses at startup — they must agree, or startup
+        // declares success on an AP the watch loop then tries to restart forever.
+        iface_is_up(&self.ap_iface)
     }
 
     /// Tear down whatever is left and start the AP again.
@@ -1111,13 +1584,19 @@ impl HotspotGuard {
         let _ = Command::new("sudo")
             .args(["create_ap", "--stop", &self.wifi_iface])
             .output();
-        std::thread::sleep(ROTATE_POLL);
+        std::thread::sleep(AP_RESTART_SETTLE);
         let launched = Command::new("sudo")
             .args([
                 "create_ap",
                 "--daemon",
                 "-c",
                 &self.channel.to_string(),
+                // `--` first: create_ap parses with GNU getopt, which permutes,
+                // so options are recognised *after* the positionals too. Without
+                // it an SSID or passphrase beginning with `-` is read as a flag
+                // (`--hidden`, `--mkconfig <file>`), silently changing what gets
+                // started or writing a file as root.
+                "--",
                 &self.wifi_iface,
                 &self.wifi_iface,
                 &self.ssid,
@@ -1133,6 +1612,9 @@ impl HotspotGuard {
             std::thread::sleep(AP_START_POLL);
             if self.is_up() {
                 return true;
+            }
+            if shutdown_requested() {
+                return false;
             }
         }
         false
@@ -1182,6 +1664,18 @@ fn generate_passphrase() -> Option<String> {
     )
 }
 
+/// Is this usable as a WPA2 passphrase?
+///
+/// `create_ap` enforces 8..=63 *characters* (bash `${#var}`) and writes the value
+/// unquoted into hostapd's config, so a newline injects arbitrary directives. We
+/// used to check `len() >= 8` — bytes, no upper bound, no content check — and
+/// only on the flag/env path, so a bad value reached create_ap, was rejected
+/// there, and surfaced as our misleading "is it installed, and does sudo work?".
+fn valid_passphrase(p: &str) -> bool {
+    let chars = p.chars().count();
+    (8..=63).contains(&chars) && !p.contains(['\n', '\r'])
+}
+
 /// Resolve the passphrase: an explicit one wins, else reuse what we generated
 /// last time, else generate one and remember it (owner-readable only).
 fn resolve_passphrase(explicit: Option<&String>) -> Option<String> {
@@ -1200,9 +1694,16 @@ fn resolve_passphrase(explicit: Option<&String>) -> Option<String> {
 
     if let Ok(stored) = std::fs::read_to_string(&path) {
         let stored = stored.trim().to_string();
-        if stored.len() >= 8 {
+        if valid_passphrase(&stored) {
             info!(path = %path.display(), "using the remembered passphrase");
             return Some(stored);
+        }
+        if !stored.is_empty() {
+            warn!(
+                path = %path.display(),
+                "the saved passphrase isn't usable (needs 8-63 characters, no newlines); \
+                 generating a new one"
+            );
         }
     }
 
@@ -1210,9 +1711,21 @@ fn resolve_passphrase(explicit: Option<&String>) -> Option<String> {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    match std::fs::write(&path, format!("{generated}\n")) {
+    // Create with 0600 rather than writing then chmod-ing. `fs::write` creates
+    // with 0666 & ~umask — measured 0644 on a default umask — so the passphrase
+    // sat world-readable for the window between the two calls, and any file left
+    // at 0644 by an earlier run stayed that way forever.
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let opened = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path);
+    match opened.and_then(|mut f| f.write_all(format!("{generated}\n").as_bytes())) {
         Ok(()) => {
-            // Best effort: a passphrase readable by other users is not a secret.
+            // `mode` only applies when *creating*, so repair an existing file.
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
             info!(path = %path.display(), "generated a hotspot passphrase and saved it");
@@ -1278,6 +1791,9 @@ fn hotspot_start(hs: &Hotspot) -> Option<HotspotGuard> {
             "--daemon",
             "-c",
             &hs.channel.to_string(),
+            // See the note in `restart` — create_ap's getopt permutes, so the
+            // positionals must be fenced off from option parsing.
+            "--",
             &iface,
             &iface,
             &hs.ssid,
@@ -1299,6 +1815,8 @@ fn hotspot_start(hs: &Hotspot) -> Option<HotspotGuard> {
         pass: pass.clone(),
         channel: hs.channel,
     };
+    // Reachable from the signal handler, which cannot run destructors.
+    let _ = HOTSPOT_IFACE.set(iface.clone());
 
     // Wait for it to actually beacon rather than assuming a duration — the
     // interface can appear seconds before hostapd finishes, or never come up at
@@ -1311,6 +1829,10 @@ fn hotspot_start(hs: &Hotspot) -> Option<HotspotGuard> {
             print_join_details(&hs.ssid, &pass);
             return Some(guard);
         }
+        if shutdown_requested() {
+            info!("stopping before the hotspot finished starting");
+            return None; // guard drops here, tearing down the half-started AP
+        }
     }
 
     error!(
@@ -1322,6 +1844,22 @@ fn hotspot_start(hs: &Hotspot) -> Option<HotspotGuard> {
 }
 
 /// Exponential backoff for watch mode: `interval * 2^(fails-1)`, capped.
+/// Poll interval to use, given how long we have been running and whether we have
+/// ever been online this run.
+///
+/// Deliberately keyed on "have we succeeded yet" rather than only on elapsed
+/// time: the fast phase exists to cover the gap between powering on and the
+/// portal becoming reachable, and that gap ends when we get in, whenever that
+/// is. The window is only a backstop so a router that never connects settles
+/// down instead of probing forever.
+fn poll_cadence(base: Duration, elapsed: Duration, been_online: bool) -> Duration {
+    if been_online || elapsed >= STARTUP_WINDOW {
+        base
+    } else {
+        base.min(STARTUP_POLL)
+    }
+}
+
 fn backoff_delay(base: Duration, fails: u32) -> Duration {
     let shift = fails.saturating_sub(1).min(16);
     let secs = base.as_secs().saturating_mul(1u64 << shift);
@@ -1331,6 +1869,11 @@ fn backoff_delay(base: Duration, fails: u32) -> Duration {
 /// Sleep for `dur`, but wake early and return `true` if a shutdown signal
 /// (SIGTERM / Ctrl-C) arrives — so `systemctl stop` exits promptly.
 async fn sleep_or_shutdown(dur: Duration, sigterm: Option<&mut Signal>) -> bool {
+    // A signal that landed while we were busy reconciling is already recorded;
+    // don't sleep out the interval before acting on it.
+    if shutdown_requested() {
+        return true;
+    }
     match sigterm {
         Some(sig) => tokio::select! {
             _ = sleep(dur) => false,
@@ -1363,6 +1906,9 @@ async fn run_watch(cfg: &Config, hotspot: Option<&HotspotGuard>) {
     // Only announce on state *changes*, so a healthy connection stays quiet
     // instead of reprinting "you're good to browse" on every poll.
     let mut online_announced = false;
+    // Drives the startup cadence: poll hard until the first sign-in lands.
+    let started = std::time::Instant::now();
+    let mut been_online = false;
     loop {
         // A hotspot that quietly died leaves devices behind it with no network
         // and nothing to tell them why, so check it every tick and bring it back.
@@ -1383,22 +1929,42 @@ async fn run_watch(cfg: &Config, hotspot: Option<&HotspotGuard>) {
             online_announced = false;
         }
 
-        let delay = if online || reconcile(cfg).await {
-            if !online_announced {
-                info!("you're good to browse — still watching");
-                online_announced = true;
-            }
-            consecutive_failures = 0;
-            cfg.interval
+        let outcome = if online {
+            Outcome::Online
         } else {
-            consecutive_failures += 1;
-            let backoff = backoff_delay(cfg.interval, consecutive_failures);
-            debug!(failures = consecutive_failures, "reconcile failed");
-            warn!(
-                "couldn't get you online — retrying in {}s",
-                backoff.as_secs()
-            );
-            backoff
+            reconcile(cfg).await
+        };
+
+        let delay = match outcome {
+            Outcome::Online => {
+                if !online_announced {
+                    info!("you're good to browse — still watching");
+                    online_announced = true;
+                }
+                consecutive_failures = 0;
+                been_online = true;
+                cfg.interval
+            }
+            // Declining is not failing. Backing off here is what made a cold
+            // boot slow: every tick spent waiting for the repeater daemon to
+            // associate would have doubled the interval, so by the time the
+            // portal was reachable we might not look for another 15 minutes.
+            // Keep checking at the normal cadence instead.
+            Outcome::Declined => {
+                debug!("nothing to do on this network right now");
+                poll_cadence(cfg.interval, started.elapsed(), been_online)
+            }
+            Outcome::Failed => {
+                consecutive_failures += 1;
+                let base = poll_cadence(cfg.interval, started.elapsed(), been_online);
+                let backoff = backoff_delay(base, consecutive_failures);
+                debug!(failures = consecutive_failures, "reconcile failed");
+                warn!(
+                    "couldn't get you online — retrying in {}s",
+                    backoff.as_secs()
+                );
+                backoff
+            }
         };
 
         if sleep_or_shutdown(delay, sigterm.as_mut()).await {
@@ -1410,7 +1976,13 @@ async fn run_watch(cfg: &Config, hotspot: Option<&HotspotGuard>) {
 
 #[tokio::main]
 async fn main() {
-    let cfg = match parse_args_from(env::args().skip(1)) {
+    // `args_os`, not `args`: the latter panics on non-Unicode arguments, and an
+    // SSID is a byte string — a latin-1 café name crashed with a backtrace
+    // instead of an error.
+    let argv = env::args_os()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned());
+    let cfg = match parse_args_from(argv) {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("error: {e}\n");
@@ -1420,11 +1992,27 @@ async fn main() {
     };
 
     init_logging(cfg.quiet);
+    // Before any long-running work, so a signal during the very first reconcile
+    // is recorded rather than missed. `--once` benefits too: its single pass can
+    // include a multi-minute rotation.
+    spawn_shutdown_listener();
 
     if cfg.once {
-        if reconcile(&cfg).await {
+        let authenticated = reconcile(&cfg).await == Outcome::Online;
+        // Success wins over a signal that arrived on the way out: we did the job,
+        // so say so. Checking shutdown first reported 130 for a run that had
+        // already authenticated, which is a lie to whatever reads the code.
+        if authenticated {
             info!("you're good to browse");
             std::process::exit(0);
+        }
+        // A single pass can block for minutes on a rotation, so it may well have
+        // been interrupted. Report that as 130 rather than as a failed login —
+        // a supervisor should not treat "the operator stopped it" as "the portal
+        // rejected us".
+        if shutdown_requested() {
+            info!("stopping — interrupted before finishing");
+            std::process::exit(130);
         }
         std::process::exit(1);
     }
@@ -1466,7 +2054,7 @@ mod tests {
         assert_eq!(cfg.ssid, DEFAULT_SSID);
         assert!(!cfg.once);
         assert!(!cfg.quiet);
-        assert_eq!(cfg.interval, Duration::from_secs(60));
+        assert_eq!(cfg.interval, Duration::from_secs(30));
     }
 
     #[test]
@@ -1582,12 +2170,88 @@ mod tests {
         assert_eq!(parse_ap_interface(""), None);
     }
 
+    /// `sirensong Starbucks Customer` (missing quotes) used to silently watch a
+    /// network called "Customer" — the default SSID has a space, so this is the
+    /// easy mistake to make.
+    /// The fast phase exists for "power the router on while already in the
+    /// cafe": it should end when we actually get online, not on a timer, with
+    /// the window only as a backstop for a router that never connects.
+    #[test]
+    fn startup_polls_fast_until_first_success() {
+        let base = Duration::from_secs(30);
+        let fast = Duration::from_secs(5);
+
+        // Fresh start, never online: poll hard.
+        assert_eq!(poll_cadence(base, Duration::ZERO, false), fast);
+        assert_eq!(poll_cadence(base, Duration::from_secs(60), false), fast);
+
+        // Success ends it immediately, however early.
+        assert_eq!(poll_cadence(base, Duration::from_secs(1), true), base);
+
+        // Never got online: settle down once the window elapses.
+        assert_eq!(poll_cadence(base, STARTUP_WINDOW, false), base);
+        assert_eq!(poll_cadence(base, Duration::from_secs(600), false), base);
+
+        // An explicitly fast --interval is never slowed down by this.
+        let user_fast = Duration::from_secs(2);
+        assert_eq!(poll_cadence(user_fast, Duration::ZERO, false), user_fast);
+    }
+
+    #[test]
+    fn parses_the_default_route_device() {
+        // Real output from the router while repeating.
+        let r = "default via 192.168.23.254 dev sta1 proto static src 192.168.23.120 metric 20\n";
+        assert_eq!(parse_default_route_device(r).as_deref(), Some("sta1"));
+        // Ethernet uplink: the station is not carrying traffic.
+        let eth = "default via 10.0.0.1 dev eth0 proto dhcp src 10.0.0.5 metric 10\n";
+        assert_eq!(parse_default_route_device(eth).as_deref(), Some("eth0"));
+        // Several routes: the first (lowest metric) is the one in use.
+        let multi =
+            "default via 10.0.0.1 dev eth0 metric 10\ndefault via 192.168.8.1 dev sta1 metric 20\n";
+        assert_eq!(parse_default_route_device(multi).as_deref(), Some("eth0"));
+        assert_eq!(parse_default_route_device(""), None);
+        assert_eq!(parse_default_route_device("default via 10.0.0.1\n"), None);
+    }
+
+    #[test]
+    fn extra_positionals_are_an_error_not_last_wins() {
+        let err = cfg_from(&["Starbucks", "Customer"]).err().unwrap();
+        assert!(err.contains("extra argument"), "got: {err}");
+        assert_eq!(
+            cfg_from(&["Starbucks Customer"]).unwrap().ssid,
+            "Starbucks Customer"
+        );
+    }
+
     #[test]
     fn hotspot_rejects_short_passphrase() {
         let err = cfg_from(&["--hotspot", "--hotspot-pass", "short"])
             .err()
             .unwrap();
-        assert!(err.contains("8 characters"), "got: {err}");
+        assert!(err.contains("8-63"), "got: {err}");
+    }
+
+    /// The limits are create_ap's, and it counts characters. Checking bytes let
+    /// a 5-character multibyte passphrase through to be rejected downstream with
+    /// a misleading message, and nothing bounded the top end at all.
+    #[test]
+    fn hotspot_passphrase_limits_are_in_characters() {
+        assert!(valid_passphrase("goodpass1"));
+        assert!(!valid_passphrase("ééééé")); // 5 chars, 10 bytes
+        assert!(valid_passphrase(&"é".repeat(8)));
+        assert!(!valid_passphrase(&"x".repeat(64)));
+        assert!(valid_passphrase(&"x".repeat(63)));
+        // A newline would inject directives into create_ap's hostapd config.
+        assert!(!valid_passphrase("abc\ndef1234"));
+    }
+
+    #[test]
+    fn hotspot_ssid_length_is_bounded() {
+        let err = cfg_from(&["--hotspot", "--hotspot-ssid", &"x".repeat(33)])
+            .err()
+            .unwrap();
+        assert!(err.contains("1-32"), "got: {err}");
+        assert!(cfg_from(&["--hotspot", "--hotspot-ssid", &"x".repeat(32)]).is_ok());
     }
 
     // Naming a hotspot you never asked to start is a typo, not an intent.
@@ -1615,7 +2279,11 @@ mod tests {
         assert_eq!(hs.ssid, default_hotspot_ssid());
         assert!(hs.ssid.ends_with("sirensong"), "got: {}", hs.ssid);
         assert_eq!(hs.channel, 1);
-        assert!(hs.pass.is_none(), "resolved at start, not at parse time");
+        // Deliberately not asserting `pass.is_none()`: parsing reads
+        // SIRENSONG_HOTSPOT_PASS, so that assertion failed for anyone who had it
+        // exported — a test that depends on the developer's shell. What actually
+        // matters here is that no *file* was read or written at parse time, which
+        // the surrounding assertions cover.
     }
 
     #[test]
@@ -1736,7 +2404,11 @@ mod tests {
             .await;
 
         let ok = http_login(&format!("{base}/generate_204")).await;
-        assert!(ok, "http_login should complete the mock portal flow");
+        assert_eq!(
+            ok,
+            Login::Submitted,
+            "http_login should complete the mock portal flow"
+        );
         // MockServer's Drop verifies the POST expectation (exactly 1 hit with
         // the right token + plan), so a wrong token would fail the test.
     }
