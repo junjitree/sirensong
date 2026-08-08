@@ -1811,10 +1811,119 @@ fn print_join_details(ssid: &str, pass: &str) {
     }
 }
 
+/// Channels this radio may *initiate* radiation on, i.e. host an AP on.
+///
+/// A channel flagged `no IR` can be associated to as a client but never beaconed
+/// on. Under some regulatory domains that covers the entire 5GHz band, so a card
+/// happily connected on 5GHz cannot host a hotspot there at all — and cannot
+/// host one on 2.4GHz either, because that would put the AP on a second channel,
+/// which most cards only allow in a restricted mode that fails to start.
+fn ap_capable_channels() -> Vec<u32> {
+    let Ok(out) = Command::new("iw").arg("phy").output() else {
+        return Vec::new();
+    };
+    parse_ap_capable_channels(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Channel numbers from `iw phy` output, excluding anything marked `no IR`,
+/// `disabled` or requiring radar detection.
+fn parse_ap_capable_channels(iw_phy: &str) -> Vec<u32> {
+    let mut out = Vec::new();
+    for line in iw_phy.lines() {
+        let t = line.trim();
+        if !t.starts_with('*') || !t.contains("MHz [") {
+            continue;
+        }
+        if t.contains("no IR") || t.contains("disabled") || t.contains("radar detection") {
+            continue;
+        }
+        if let Some(open) = t.find('[')
+            && let Some(close) = t[open..].find(']')
+            && let Ok(ch) = t[open + 1..open + close].trim().parse::<u32>()
+        {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// If the station sits on a band we cannot beacon on, move it to one we can.
+///
+/// Only ever called for `--hotspot`, and only when the alternative is no hotspot
+/// at all. It costs the uplink's 5GHz throughput, so it says so rather than
+/// quietly downgrading the connection. The change is `--temporary`: in memory
+/// only, forgotten when NetworkManager restarts, so the saved profile is left
+/// alone.
+fn pin_to_ap_capable_band(iface: &str, ssid: &str) -> bool {
+    let capable = ap_capable_channels();
+    if capable.is_empty() {
+        return false;
+    }
+    match station_channel(iface) {
+        Some(ch) if capable.contains(&ch) => return true, // already fine
+        _ => {}
+    }
+    // 2.4GHz is where the usable channels almost always are when 5GHz is no-IR.
+    if !capable.iter().any(|c| *c <= 14) {
+        warn!("no channel on this radio may host an AP; the hotspot cannot start");
+        return false;
+    }
+
+    warn!(
+        "the Wi-Fi is on a channel this adapter may not transmit on, so a hotspot \
+         cannot run alongside it — switching the connection to 2.4GHz. This trades \
+         the link's 5GHz speed for the hotspot; the change is temporary and is \
+         forgotten when NetworkManager restarts"
+    );
+    let modified = Command::new("nmcli")
+        .args([
+            "connection",
+            "modify",
+            "--temporary",
+            ssid,
+            "802-11-wireless.band",
+            "bg",
+        ])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !modified {
+        warn!("could not pin the connection to 2.4GHz; leaving it alone");
+        return false;
+    }
+    let _ = Command::new("nmcli")
+        .args(["connection", "down", ssid])
+        .output();
+    let _ = Command::new("nmcli")
+        .args(["connection", "up", ssid])
+        .output();
+
+    // Wait for it to land somewhere we can actually beacon.
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(500));
+        if shutdown_requested() {
+            return false;
+        }
+        if let Some(ch) = station_channel(iface)
+            && capable.contains(&ch)
+        {
+            info!(
+                channel = ch,
+                "reconnected on a channel that can host the hotspot"
+            );
+            return true;
+        }
+    }
+    warn!("the connection did not come back on a channel that can host an AP");
+    false
+}
+
 /// Bring up the hotspot on the same radio as the client connection. Returns a
 /// guard that tears it down on drop; `None` if it could not be started.
-fn hotspot_start(hs: &Hotspot) -> Option<HotspotGuard> {
+fn hotspot_start(hs: &Hotspot, ssid: &str) -> Option<HotspotGuard> {
     let iface = wifi_device()?;
+    // A 5GHz-only-no-IR radio cannot host an AP at all; move the link first.
+    pin_to_ap_capable_band(&iface, ssid);
     let pass = resolve_passphrase(hs.pass.as_ref())?;
     warn_if_regdom_blocks_ap();
 
@@ -2095,7 +2204,7 @@ async fn main() {
                 warn!("--hotspot ignored: this router already serves its own Wi-Fi");
                 None
             }
-            Backend::NetworkManager => match hotspot_start(hs) {
+            Backend::NetworkManager => match hotspot_start(hs, &cfg.ssid) {
                 Some(guard) => Some(guard),
                 None => {
                     error!("could not start the hotspot; continuing without it");
@@ -2263,6 +2372,28 @@ mod tests {
         // An explicitly fast --interval is never slowed down by this.
         let user_fast = Duration::from_secs(2);
         assert_eq!(poll_cadence(user_fast, Duration::ZERO, false), user_fast);
+    }
+
+    /// Real `iw phy` output from the laptop: every 5GHz channel is `no IR`, so
+    /// only 2.4GHz can host an AP. This is what made `--hotspot` fail while the
+    /// station was on 5GHz — the card can associate there but never beacon.
+    #[test]
+    fn ap_capable_channels_exclude_no_ir() {
+        let iw = "\t\t\t* 2412.0 MHz [1] (20.0 dBm)\n\
+                  \t\t\t* 2437.0 MHz [6] (20.0 dBm)\n\
+                  \t\t\t* 2462.0 MHz [11] (20.0 dBm)\n\
+                  \t\t\t* 5180.0 MHz [36] (20.0 dBm) (no IR)\n\
+                  \t\t\t* 5805.0 MHz [161] (20.0 dBm) (no IR)\n\
+                  \t\t\t* 5260.0 MHz [52] (20.0 dBm) (radar detection)\n\
+                  \t\t\t* 5320.0 MHz [64] (disabled)\n";
+        let ch = parse_ap_capable_channels(iw);
+        assert_eq!(ch, vec![1, 6, 11]);
+        assert!(!ch.contains(&161), "no-IR channels cannot host an AP");
+        assert!(
+            !ch.contains(&52),
+            "radar channels need DFS, not usable here"
+        );
+        assert!(!ch.contains(&64));
     }
 
     #[test]
