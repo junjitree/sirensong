@@ -8,6 +8,17 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-08-08
+
+### Changed
+
+- The README's travel-router section now links to [`router/`](router/), which
+  ships the procd service, UCI config and the hardware-slider handler. It
+  previously described the service files without saying they exist in the repo,
+  so anyone following it would have written them from scratch — and would never
+  have found the post-reflash checklist of settings a firmware upgrade silently
+  restores to their defaults.
+
 ## [0.1.5] - 2026-08-08
 
 ### Fixed
@@ -261,7 +272,8 @@ Initial release.
 - The Python implementation and the bundled systemd unit (watch mode covers the
   latter).
 
-[unreleased]: https://github.com/junjitree/sirensong/compare/v0.1.5...main
+[unreleased]: https://github.com/junjitree/sirensong/compare/v0.1.6...main
+[0.1.6]: https://github.com/junjitree/sirensong/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/junjitree/sirensong/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/junjitree/sirensong/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/junjitree/sirensong/compare/v0.1.2...v0.1.3
