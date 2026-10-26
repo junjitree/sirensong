@@ -8,6 +8,15 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Security
+
+- Updated locked dependencies to clear the RustSec advisories that were failing
+  the weekly `cargo audit` job: `rustls` 0.23.46 (ServerHello key-exchange
+  downgrade, TLS 1.3 encryption-level confusion, secrets in `Debug`),
+  `rustls-webpki` 0.103.16 and `webpki-roots` 1.0.11 (distrusted intermediates
+  accepted), `h2` 0.4.20 (unbounded empty DATA frames) and `quinn-proto` 0.11.19
+  (remote panics and memory exhaustion).
+
 ## [0.1.6] - 2026-08-08
 
 ### Changed
