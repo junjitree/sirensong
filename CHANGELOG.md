@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-10-26
+
 ### Security
 
 - Updated locked dependencies to clear the RustSec advisories that were failing
@@ -281,7 +283,8 @@ Initial release.
 - The Python implementation and the bundled systemd unit (watch mode covers the
   latter).
 
-[unreleased]: https://github.com/junjitree/sirensong/compare/v0.1.6...main
+[unreleased]: https://github.com/junjitree/sirensong/compare/v0.1.7...main
+[0.1.7]: https://github.com/junjitree/sirensong/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/junjitree/sirensong/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/junjitree/sirensong/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/junjitree/sirensong/compare/v0.1.3...v0.1.4
